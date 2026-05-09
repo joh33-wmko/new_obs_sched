@@ -334,6 +334,74 @@ def choose_sheet(sheet_names, file_path, default_sheet=None, parent=None):
     dialog.wait_window()
     return None if cancelled[0] else selected.get()
 
+def confirm_staff_type_dialog(staff_type, file_path, parent=None):
+    """Show detected staff type and let user confirm before proceeding."""
+    dialog = tk.Toplevel(parent)
+    dialog.title("Confirm Staff Type")
+    dialog.geometry("500x200")
+    dialog.resizable(False, False)
+
+    staff_type_display = staff_type.upper() if staff_type else "UNKNOWN"
+    cancelled = [False]
+
+    tk.Label(
+        dialog,
+        text=(
+            f"File: {Path(file_path).name}\n\n"
+            f"Detected staff type: {staff_type_display}\n\n"
+            "Is this correct?"
+        ),
+        padx=16,
+        pady=20,
+        justify="left",
+        wraplength=460
+    ).pack()
+
+    def confirm():
+        dialog.destroy()
+
+    def cancel():
+        cancelled[0] = True
+        dialog.destroy()
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=10)
+    tk.Button(btn_frame, text="Yes, Continue", command=confirm).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="No, Cancel", command=cancel).pack(side="left", padx=6)
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+    return not cancelled[0]
+
+
+def apply_staff_type_processing(df, staff_type):
+    """Apply type-specific data transformations and validations."""
+    if not staff_type:
+        return df
+
+    staff_type_lower = staff_type.lower()
+
+    # Type-specific processing
+    if staff_type_lower == "na":
+        # NA-specific: ensure Date column exists (schedule format)
+        if "Date" not in df.columns:
+            messagebox.showwarning(
+                "Invalid NA file",
+                "NA schedule files must contain a 'Date' column."
+            )
+    elif staff_type_lower == "oa":
+        # OA-specific: validation/processing (to be defined)
+        pass
+    elif staff_type_lower == "sa":
+        # SA-specific: validation/processing (to be defined)
+        pass
+
+    return df
+
 def open_in_calc(file_path, sheet_name):
     launcher = shutil.which("libreoffice") or shutil.which("soffice")
     if not launcher:
@@ -429,7 +497,7 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
     dialog.wait_window()
 
 
-def export_sheet(file_path, sheet_name, data_dir, upload_enabled):
+def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=None):
     df = pd.read_excel(
         file_path,
         sheet_name=sheet_name,
@@ -437,6 +505,9 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled):
         engine="openpyxl"
     )
     df.columns = _flatten_headers(df.columns)
+
+    # Apply staff-type-specific processing
+    df = apply_staff_type_processing(df, staff_type)
 
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%m/%d/%y")
@@ -527,6 +598,12 @@ def main():
     data_dir = ensure_data_dir()
     copied_file_path = copy_source_to_data_dir(file_path, data_dir)
 
+    # Detect and confirm staff type
+    detected_staff_type = _normalize_staff_type(Path(copied_file_path).stem)
+    if not confirm_staff_type_dialog(detected_staff_type or "unknown", copied_file_path, parent=root):
+        root.destroy()
+        return
+
     sheets = get_sheet_names(copied_file_path)
 
     # Open spreadsheet visually
@@ -544,7 +621,7 @@ def main():
         return
 
     # Export selected sheet
-    result = export_sheet(copied_file_path, chosen_sheet, data_dir, upload_enabled)
+    result = export_sheet(copied_file_path, chosen_sheet, data_dir, upload_enabled, staff_type=detected_staff_type)
     if not result:
         root.destroy()
         return
