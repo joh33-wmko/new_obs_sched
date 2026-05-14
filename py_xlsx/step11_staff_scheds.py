@@ -1007,43 +1007,6 @@ def focus_converted_file(file_path):
             subprocess.Popen(["open", "-R", str(target)])
 
 
-def show_quick_view_instructions(output_path):
-    dialog = tk.Toplevel()
-    dialog.title("Quick View Instructions")
-    dialog.geometry("400x120")
-    dialog.resizable(False, False)
-    cancelled = [False]
-
-    tk.Label(
-        dialog,
-        text="Press space bar for quick view and press again to close quick view",
-        padx=16,
-        pady=24,
-        wraplength=350
-    ).pack()
-
-    def close_and_refocus():
-        dialog.destroy()
-        focus_converted_file(output_path)
-
-    def cancel():
-        cancelled[0] = True
-        dialog.destroy()
-
-    btn_frame = tk.Frame(dialog)
-    btn_frame.pack(pady=10)
-    tk.Button(btn_frame, text="OK", command=close_and_refocus).pack(side="left", padx=6)
-    tk.Button(btn_frame, text="Cancel", command=cancel).pack(side="left", padx=6)
-
-    dialog.protocol("WM_DELETE_WINDOW", cancel)
-    dialog.lift()
-    dialog.focus_force()
-    dialog.attributes("-topmost", True)
-    # dialog.grab_set()
-    dialog.wait_window()
-    return cancelled[0]
-
-
 def show_final_completion_dialog(output=None, upload_message=None, sql_file=None, parent=None):
     dialog = tk.Toplevel(parent)
     dialog.title("Conversions Complete")
@@ -1137,8 +1100,6 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
                 f"===== Processing staff type: {upload_type.upper()} =====\n"
                 #f"Verbose HTTP {verbose_response.status_code}\nFinal HTTP {final_response.status_code}\n\n"
             )
-            # if show_quick_view_instructions(sql_file)\
-            #     return False
         except Exception as error:
             upload_message = f"Upload failed: {error}"
     else:
