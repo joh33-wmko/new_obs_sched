@@ -4,6 +4,7 @@
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import datetime
 import importlib
 import ast
 import html
@@ -14,7 +15,6 @@ import ssl
 import subprocess
 import sys
 import time
-import shlex
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -22,11 +22,6 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
-
-# from save.notes.obs_sched.py_xlsx.xlsx2csv import STAFF_UPLOAD_URL
-
-LAST_GENERATED_CSV_FILENAME = None
-# STAFF_UPLOAD_URL = "https://www.keck.hawaii.edu/sandbox/jhayashi/newSemester/staffScheduleUpload.php"
 
 def load_live_config(config_path=None):
     config_file = Path(config_path) if config_path else Path.cwd() / "config.live.ini"
@@ -55,15 +50,11 @@ def load_live_config(config_path=None):
 
 
 LIVE_CONFIG = load_live_config()
-STAFF_UPLOAD_URL = LIVE_CONFIG.get("NEW_OBS_SEM", {}).get("STAFF_UPLOAD_URL", "https://default.upload.url")
 
 
-def is_valid_http_url(value):
-    if not value or not isinstance(value, str):
-        return False
-
-    parsed = urlparse(value.strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+def get_config(section, key, default=None):
+    """Get a configuration value from LIVE_CONFIG."""
+    return LIVE_CONFIG.get(section, {}).get(key, default)
 
 
 class LegacyTLSAdapter(HTTPAdapter):
@@ -314,6 +305,56 @@ def ensure_data_dir():
     return data_dir
 
 
+def write_db_report(report_text, report_type, data_dir):
+    """Append a database report to Step11_db_report.txt with type and timestamp."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_file = data_dir / "Step11_db_report.txt"
+    with open(report_file, "a", encoding="utf-8") as handle:
+        handle.write(f"[{report_type}] {timestamp}\n")
+        handle.write(report_text.strip() + "\n\n")
+    return report_file
+
+
+def detect_processed_report_type(data_dir):
+    """Infer processed report type from last generated CSV filename."""
+    tracker_file = data_dir / "last_generated_csv_filename.txt"
+    if not tracker_file.exists():
+        return "UNKNOWN"
+
+    filename = tracker_file.read_text(encoding="utf-8").strip()
+    stem = Path(filename).stem
+    match = re.search(
+        r"(?<![A-Za-z0-9])(OA|NA|SA|SWOC|EEOC)(?![A-Za-z0-9])",
+        stem,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).upper() if match else "UNKNOWN"
+
+
+def fetch_db_snapshot(cursor, main_table, type_columns, staff_types):
+    """Fetch total rows and per-type counts for a table snapshot."""
+    cursor.execute(f"SELECT COUNT(*) FROM `{main_table}`;")
+    total_rows = cursor.fetchone()[0]
+
+    type_counts = {}
+    cursor.execute(f"SHOW COLUMNS FROM `{main_table}`;")
+    available_columns = {row[0].lower() for row in cursor.fetchall()}
+    type_column = next(
+        (name for name in type_columns if name.lower() in available_columns),
+        None,
+    )
+
+    if type_column:
+        for staff_type in staff_types:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM `{main_table}` WHERE LOWER(`{type_column}`) LIKE %s;",
+                (f"%{staff_type}%",),
+            )
+            type_counts[staff_type] = cursor.fetchone()[0]
+
+    return total_rows, type_counts
+
+
 def copy_source_to_data_dir(file_path, data_dir):
     source = Path(file_path)
     destination = data_dir / source.name
@@ -325,13 +366,13 @@ def copy_source_to_data_dir(file_path, data_dir):
 
 
 def store_last_csv_filename(output_path, data_dir):
-    global LAST_GENERATED_CSV_FILENAME
-    LAST_GENERATED_CSV_FILENAME = output_path.name
+    """Record the last generated CSV filename for reference."""
     tracker_file = data_dir / "last_generated_csv_filename.txt"
-    tracker_file.write_text(f"{LAST_GENERATED_CSV_FILENAME}\n", encoding="utf-8")
+    tracker_file.write_text(f"{output_path.name}\n", encoding="utf-8")
 
 
 def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
+    """Detect staff type from filename or return default."""
     if xlsx_file_path:
         xlsx_staff = _normalize_staff_type(Path(xlsx_file_path).stem)
         if xlsx_staff:
@@ -342,8 +383,7 @@ def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
         if csv_staff:
             return csv_staff.lower()
 
-    # Default to eeoc for generated swoc-like uploads without detectable staff type.
-    return "eeoc"
+    return get_config("NEW_OBS_SEM", "DEFAULT_UPLOAD_TYPE", "eeoc")
 
 
 def get_mysql_connection_settings(section_name):
@@ -559,54 +599,38 @@ def connect_to_remote_mysql_db():
         connection = None
         try:
             tunnel_process = _start_ssh_tunnel(settings)
+            db_name = settings["database"]
+            connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
+            
             connection = pymysql.connect(
                 host=settings["host"],
                 user=settings["user"],
                 password=settings["password"],
-                database=settings["database"] or None,
+                database=db_name,
                 port=settings["port"],
-                connect_timeout=10,
+                connect_timeout=connect_timeout,
             )
+            type_columns = get_config("DB_SERVER", "TYPE_COLUMNS", [])
+            staff_types = get_config("DB_SERVER", "STAFF_TYPES", [])
             with connection.cursor() as cursor:
-                # Switch to keckOperations
-                cursor.execute("USE keckOperations;")
-                # Get total row count
                 cursor.execute("SHOW TABLES;")
                 tables = [row[0] for row in cursor.fetchall()]
-                # Try to find the main table (prefer 'staff_schedule' or first table)
-                main_table = None
-                for t in tables:
-                    if t.lower() in ("staff_schedule", "staffschedule", "schedule"):
-                        main_table = t
-                        break
+                
+                # Find main table from preferred list
+                preferred = get_config("DB_SERVER", "PREFERRED_TABLES", [])
+                main_table = next((t for t in tables if t.lower() in [p.lower() for p in preferred]), None)
                 if not main_table and tables:
                     main_table = tables[0]
                 if not main_table:
-                    messagebox.showerror("No tables found", "No tables found in keckOperations database.")
+                    messagebox.showerror("No tables found", f"No tables found in {db_name} database.")
                     return False
 
-                cursor.execute(f"SELECT COUNT(*) FROM `{main_table}`;")
-                total_rows = cursor.fetchone()[0]
-
-                # Staff type counts
-                type_counts = {}
-                cursor.execute(f"SHOW COLUMNS FROM `{main_table}`;")
-                available_columns = {row[0].lower() for row in cursor.fetchall()}
-                type_column = next(
-                    (
-                        name
-                        for name in ("type", "staff_type", "stafftype", "category")
-                        if name in available_columns
-                    ),
-                    None,
+                total_rows, type_counts = fetch_db_snapshot(
+                    cursor,
+                    main_table,
+                    type_columns,
+                    staff_types,
                 )
-                if type_column:
-                    for staff_type in ["na", "oa", "sa", "swoc", "eeoc"]:
-                        cursor.execute(
-                            f"SELECT COUNT(*) FROM `{main_table}` WHERE LOWER(`{type_column}`) LIKE %s;",
-                            (f"%{staff_type}%",),
-                        )
-                        type_counts[staff_type] = cursor.fetchone()[0]
 
                 # Get MySQL version
                 cursor.execute("SELECT VERSION()")
@@ -622,11 +646,12 @@ def connect_to_remote_mysql_db():
             msg = (
                 f"Connected using [{settings['section']}] {settings['host']}:{settings['port']}\n"
                 f"Server version: {mysql_version}\n\n"
-                f"Database: keckOperations\nTable: {main_table}\n\n"
+                f"Database: {db_name}\nTable: {main_table}\n\n"
                 f"Total rows: {total_rows}\n"
                 + type_summary
             )
             messagebox.showinfo("MySQL Table Stats", msg)
+            write_db_report(msg, "BEFORE_INSERT", ensure_data_dir())
 
             # Show the generated INSERT statements from the last SQL file
             show_insert_statements_preview()
@@ -651,21 +676,46 @@ def connect_to_remote_mysql_db():
                     if sql_file.exists():
                         # Apply the inserts
                         stats = apply_insert_statements_to_database(connection, sql_file)
+                        processed_type = detect_processed_report_type(data_dir)
+
+                        with connection.cursor() as snapshot_cursor:
+                            post_total_rows, post_type_counts = fetch_db_snapshot(
+                                snapshot_cursor,
+                                main_table,
+                                type_columns,
+                                staff_types,
+                            )
+                        post_type_summary = (
+                            "\n".join(f"{k.upper()}: {v}" for k, v in post_type_counts.items())
+                            if post_type_counts
+                            else "Type breakdown unavailable (no type-like column found)."
+                        )
+                        end_delimiter = (
+                            "\n" + ("=" * 72) + "\n"
+                            + f"END OF PROCESSING FOR TYPE: {processed_type}\n"
+                            + ("=" * 72)
+                        )
                         
                         # Write results to file
                         result_file = write_insert_results_to_file(stats, sql_file, data_dir)
                         
                         # Show results
                         result_msg = (
-                            f"Database Insert Results\n\n"
+                            f"Database Insert Results for {processed_type}\n\n"
                             f"Total statements: {stats['total']}\n"
                             f"✓ Inserted successfully: {stats['success']}\n"
                             f"⊘ Already existed (skipped): {stats['already_exists']}\n"
                             f"✗ Failed: {stats['failed']}\n\n"
-                            f"Detailed results saved to:\n{result_file.name}"
+                            f"After Insert Snapshot\n"
+                            f"Table: {main_table}\n"
+                            f"Total rows: {post_total_rows}\n"
+                            f"{post_type_summary}\n\n"
+                            f"Detailed results saved to:\n{result_file.name}\n"
+                            f"{end_delimiter}"
                         )
                         
                         messagebox.showinfo("Insert Results", result_msg)
+                        write_db_report(result_msg, "AFTER_INSERT", ensure_data_dir())
             
             return True
         except Exception as error:
@@ -717,12 +767,13 @@ def preflight_mysql_connection_check():
         connection = None
         try:
             tunnel_process = _start_ssh_tunnel(settings)
+            query_timeout = get_config("DB_SERVER", "QUERY_TIMEOUT", 5)
             connection = pymysql.connect(
                 host=settings["host"],
                 user=settings["user"],
                 password=settings["password"],
                 port=settings["port"],
-                connect_timeout=5,
+                connect_timeout=query_timeout,
             )
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
@@ -747,19 +798,18 @@ def preflight_mysql_connection_check():
 
 
 def upload_csv_to_staff_site(csv_path, upload_type, verbose_enabled):
+    """Upload CSV file to staff schedule service."""
     session = requests.Session()
     session.mount("https://", LegacyTLSAdapter())
 
-    form_data = {
-        "type": upload_type,
-        "submit": "Submit",
-    }
+    form_data = {"type": upload_type, "submit": "Submit"}
     if verbose_enabled:
         form_data["verbose"] = "on"
 
+    upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
     with open(csv_path, "rb") as file_handle:
         response = session.post(
-            str(STAFF_UPLOAD_URL),
+            str(upload_url),
             data=form_data,
             files={"file": (Path(csv_path).name, file_handle, "text/csv")},
             timeout=60,
@@ -1065,10 +1115,11 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
     sql_file = None
 
     if upload_enabled:
-        if not is_valid_http_url(STAFF_UPLOAD_URL):
+        upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
+        if not upload_url:
             messagebox.showerror(
                 "Invalid upload URL",
-                f"STAFF_UPLOAD_URL is missing or invalid in config.live.ini.\nCurrent value: {STAFF_UPLOAD_URL}"
+                "STAFF_UPLOAD_URL is missing in config.live.ini"
             )
             return False
 
