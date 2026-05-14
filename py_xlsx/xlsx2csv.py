@@ -2,29 +2,31 @@
 # Step 11: Staff Schedule Uploader
 # This script converts an Excel file to CSV format and optionally uploads it to the staff schedule site.
 
-# Usage with Python 3.13:
-# % python xlsx2csv.py
-# Follow dialog prompts to select the Excel file, choose the sheet, and review upload results.
-
 import tkinter as tk
-from tkinter import filedialog, messagebox   #, simpledialog
-import pandas as pd
-import subprocess
-import shutil 
-import sys
-#import time
-import re
-import ssl
-import html
+from tkinter import filedialog, messagebox
+import importlib
 import ast
-import requests
+import html
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import shlex
 from pathlib import Path
 from urllib.parse import urlparse
+
+import pandas as pd
+import requests
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
-LAST_GENERATED_CSV_FILENAME = None
+# from save.notes.obs_sched.py_xlsx.xlsx2csv import STAFF_UPLOAD_URL
 
+LAST_GENERATED_CSV_FILENAME = None
+# STAFF_UPLOAD_URL = "https://www.keck.hawaii.edu/sandbox/jhayashi/newSemester/staffScheduleUpload.php"
 
 def load_live_config(config_path=None):
     config_file = Path(config_path) if config_path else Path.cwd() / "config.live.ini"
@@ -43,7 +45,7 @@ def load_live_config(config_path=None):
     if isinstance(parsed, dict):
         return parsed
 
-    namespace: dict = {}
+    namespace = {}
     try:
         exec(compile(content, str(config_file), "exec"), {"__builtins__": {}}, namespace)
     except Exception:
@@ -53,7 +55,7 @@ def load_live_config(config_path=None):
 
 
 LIVE_CONFIG = load_live_config()
-STAFF_UPLOAD_URL = LIVE_CONFIG.get("NEW_OBS_SEM", {}).get("STAFF_UPLOAD_TOOL", None)
+STAFF_UPLOAD_URL = LIVE_CONFIG.get("NEW_OBS_SEM", {}).get("STAFF_UPLOAD_URL", "https://default.upload.url")
 
 
 def is_valid_http_url(value):
@@ -62,6 +64,7 @@ def is_valid_http_url(value):
 
     parsed = urlparse(value.strip())
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
 
 class LegacyTLSAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
@@ -74,6 +77,133 @@ class LegacyTLSAdapter(HTTPAdapter):
             ssl_context=context,
             **pool_kwargs,
         )
+
+
+def show_scrollable_text_dialog(title, text):
+    dialog = tk.Toplevel()
+    dialog.title(title)
+    dialog.geometry("900x500")
+    dialog.resizable(True, True)
+
+    frame = tk.Frame(dialog)
+    frame.pack(fill="both", expand=True)
+
+    scrollbar = tk.Scrollbar(frame)
+    scrollbar.pack(side="right", fill="y")
+
+    text_widget = tk.Text(frame, wrap="none", yscrollcommand=scrollbar.set)
+    text_widget.insert("1.0", text)
+    text_widget.config(state="disabled")
+    text_widget.pack(side="left", fill="both", expand=True)
+
+    scrollbar.config(command=text_widget.yview)
+
+    btn = tk.Button(dialog, text="Close", command=dialog.destroy)
+    btn.pack(pady=8)
+
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+
+def apply_insert_statements_to_database(connection, sql_file):
+    """Execute INSERT statements from SQL file and track results."""
+    stats = {
+        'total': 0,
+        'success': 0,
+        'failed': 0,
+        'already_exists': 0,
+        'statements': []  # List of (statement, status, error) tuples
+    }
+    
+    sql_text = sql_file.read_text(encoding="utf-8")
+    statements = extract_insert_statements(sql_text)
+    
+    if not statements:
+        stats['total'] = 0
+        return stats
+    
+    cursor = connection.cursor()
+    try:
+        for stmt in statements:
+            stats['total'] += 1
+            status = None
+            error_msg = None
+            
+            try:
+                cursor.execute(stmt)
+                connection.commit()
+                stats['success'] += 1
+                status = 'SUCCESS'
+            except Exception as e:
+                error_msg = str(e)
+                # Check if it's a duplicate key error (already exists)
+                if 'Duplicate entry' in error_msg or 'duplicate' in error_msg.lower():
+                    stats['already_exists'] += 1
+                    status = 'DUPLICATE'
+                else:
+                    stats['failed'] += 1
+                    status = 'FAILED'
+            
+            stats['statements'].append((stmt, status, error_msg))
+    finally:
+        cursor.close()
+    
+    return stats
+
+
+def write_insert_results_to_file(stats, sql_file, data_dir):
+    """Write INSERT execution results to a detailed report file."""
+    result_file = data_dir / f"{sql_file.stem}_results.txt"
+    
+    with open(result_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("DATABASE INSERT EXECUTION RESULTS\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write("SUMMARY\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Total Statements: {stats['total']}\n")
+        f.write(f"✓ Inserted Successfully: {stats['success']}\n")
+        f.write(f"⊘ Already Existed (Skipped): {stats['already_exists']}\n")
+        f.write(f"✗ Failed: {stats['failed']}\n\n")
+        
+        f.write("DETAILED RESULTS\n")
+        f.write("-" * 80 + "\n\n")
+        
+        for idx, (stmt, status, error) in enumerate(stats['statements'], 1):
+            f.write(f"[{idx}/{stats['total']}] {status}\n")
+            f.write(f"  {stmt[:100]}{'...' if len(stmt) > 100 else ''}\n")
+            if error:
+                f.write(f"  ERROR: {error[:150]}{'...' if len(error) > 150 else ''}\n")
+            f.write("\n")
+    
+    return result_file
+
+
+def show_insert_statements_preview():
+    # Find the last generated SQL file
+    data_dir = ensure_data_dir()
+    tracker_file = data_dir / "last_generated_csv_filename.txt"
+    if not tracker_file.exists():
+        messagebox.showwarning("No SQL file", "No last_generated_csv_filename.txt found.")
+        return
+    csv_stem = tracker_file.read_text(encoding="utf-8").strip().rsplit(".csv", 1)[0]
+    sql_file = data_dir / f"{csv_stem}.sql"
+    if not sql_file.exists():
+        messagebox.showwarning("No SQL file", f"No SQL file found: {sql_file}")
+        return
+    sql_text = sql_file.read_text(encoding="utf-8")
+    # Extract INSERT statements
+    statements = extract_insert_statements(sql_text)
+    if not statements:
+        messagebox.showinfo("No INSERTs found", f"No INSERT statements found in {sql_file.name}.")
+        return
+
+    # Show in a scrollable dialog
+    show_scrollable_text_dialog("Preview INSERT Statements", "\n\n".join(statements))
 
 
 def _clean_header_value(value):
@@ -214,6 +344,406 @@ def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
 
     # Default to eeoc for generated swoc-like uploads without detectable staff type.
     return "eeoc"
+
+
+def get_mysql_connection_settings(section_name):
+    db_config = LIVE_CONFIG.get(section_name, {})
+
+    host = db_config.get("MYSQL_HOST") or db_config.get("DB_HOST")
+    user = db_config.get("DB_USER") or db_config.get("MYSQL_USER")
+    password = db_config.get("DB_PASS") or db_config.get("MYSQL_PASS")
+    database = db_config.get("DB_NAME") or db_config.get("MYSQL_DATABASE")
+
+    port_value = db_config.get("MYSQL_PORT") or db_config.get("DB_PORT") or 3306
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        port = 3306
+
+    ssh_port_value = db_config.get("SSH_PORT", 22)
+    try:
+        ssh_port = int(ssh_port_value)
+    except (TypeError, ValueError):
+        ssh_port = 22
+
+    mysql_remote_port_value = db_config.get("MYSQL_REMOTE_PORT", 3306)
+    try:
+        mysql_remote_port = int(mysql_remote_port_value)
+    except (TypeError, ValueError):
+        mysql_remote_port = 3306
+
+    return {
+        "section": section_name,
+        "host": host,
+        "user": user,
+        "password": password,
+        "database": database,
+        "port": port,
+        "ssh_tunnel_enabled": bool(db_config.get("SSH_HOST") and db_config.get("SSH_USER")),
+        "ssh_host": db_config.get("SSH_HOST"),
+        "ssh_user": db_config.get("SSH_USER"),
+        "ssh_port": ssh_port,
+        "ssh_key_file": db_config.get("SSH_KEY_FILE") or LIVE_CONFIG.get("SSH_KEY_FILE"),
+        "mysql_remote_host": db_config.get("MYSQL_REMOTE_HOST") or "127.0.0.1",
+        "mysql_remote_port": mysql_remote_port,
+    }
+
+
+def _is_tcp_port_open(host, port, timeout=1.0):
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _start_ssh_tunnel(settings):
+    if not settings.get("ssh_tunnel_enabled"):
+        return None
+
+    local_host = settings.get("host") or "127.0.0.1"
+    local_port = settings.get("port") or 3306
+
+    # If something is already listening on the configured local endpoint,
+    # assume an existing tunnel is active and reusable.
+    if _is_tcp_port_open(local_host, local_port):
+        return None
+
+    ssh_target = f"{settings['ssh_user']}@{settings['ssh_host']}"
+    bind_spec = (
+        f"{local_host}:{local_port}:"
+        f"{settings['mysql_remote_host']}:{settings['mysql_remote_port']}"
+    )
+    
+    # Try to use sshpass if available (for automated password auth)
+    sshpass_available = shutil.which("sshpass") is not None
+    
+    if sshpass_available:
+        # Use sshpass to automate password entry
+        # For SSH tunnel, we need MYSQL_PASS (SSH user password), not DB_PASS
+        db_config = LIVE_CONFIG.get(settings.get("section", "DB_SERVER"), {})
+        ssh_password = db_config.get("MYSQL_PASS") or ""
+        if not ssh_password:
+            raise RuntimeError(
+                "SSH password automation enabled (sshpass found) but no MYSQL_PASS in config.\n"
+                "Set MYSQL_PASS in DB_SERVER section for SSH authentication."
+            )
+        
+        command = [
+            "sshpass",
+            "-p",
+            ssh_password,
+            "ssh",
+            "-N",
+            "-L",
+            bind_spec,
+            "-p",
+            str(settings["ssh_port"]),
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "UserKnownHostsFile=/dev/null",
+            ssh_target,
+        ]
+    else:
+        # Fallback: provide manual instructions
+        manual_cmd = (
+            f"ssh -N -L {bind_spec} -p {settings['ssh_port']} {ssh_target}"
+        )
+        raise RuntimeError(
+            "SSH tunnel requires sshpass for automated password authentication.\n\n"
+            "Install sshpass:\n"
+            "  brew install sshpass\n\n"
+            "Or set up manually in another terminal:\n"
+            f"  {manual_cmd}\n"
+            "Then re-run this script."
+        )
+
+    # Start tunnel process
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to start SSH tunnel with sshpass: {error}"
+        )
+
+    # Wait for tunnel to become ready (up to 90 seconds)
+    max_wait_iterations = 180
+    for iteration in range(max_wait_iterations):
+        # Check if process exited early (indicates failure)
+        if process.poll() is not None:
+            exit_code = process.returncode
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"SSH tunnel exited with code {exit_code}.\n"
+                    "Possible causes:\n"
+                    "  - Wrong SSH password in config\n"
+                    "  - Remote host unreachable\n"
+                    "  - SSH key authorization issue\n\n"
+                    "Verify credentials and connectivity, then retry."
+                )
+            break
+        
+        # Check if port is now open
+        if _is_tcp_port_open(local_host, local_port, timeout=0.5):
+            return process
+        
+        time.sleep(0.5)
+
+    # Timeout reached
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    
+    raise RuntimeError(
+        f"SSH tunnel did not open local port {local_port} within {max_wait_iterations * 0.5:.0f}s.\n"
+        "The SSH process may have encountered an authentication issue.\n"
+        "Check MYSQL_PASS in config and retry."
+    )
+
+
+def _stop_ssh_tunnel(process):
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def get_mysql_connection_candidates():
+    candidates = []
+    settings = get_mysql_connection_settings("DB_SERVER")
+    if settings.get("host") and settings.get("user") and settings.get("password"):
+        candidates.append(settings)
+    return candidates
+
+
+def connect_to_remote_mysql_db():
+    candidates = get_mysql_connection_candidates()
+    if not candidates:
+        messagebox.showerror(
+            "Missing MySQL settings",
+            "No MySQL connection sections found in config.live.ini.\n"
+            "Expected section: DB_SERVER."
+        )
+        return False
+
+    try:
+        pymysql = importlib.import_module("pymysql")
+    except ImportError:
+        messagebox.showerror(
+            "Missing MySQL client",
+            "PyMySQL is not installed. Install it before trying to connect to the remote MySQL database."
+        )
+        return False
+
+    failures = []
+    for settings in candidates:
+        tunnel_process = None
+        missing = [name for name in ("host", "user", "password") if not settings.get(name)]
+        if missing:
+            failures.append(
+                f"[{settings.get('section')}] missing required keys: {', '.join(missing)}"
+            )
+            continue
+
+        connection = None
+        try:
+            tunnel_process = _start_ssh_tunnel(settings)
+            connection = pymysql.connect(
+                host=settings["host"],
+                user=settings["user"],
+                password=settings["password"],
+                database=settings["database"] or None,
+                port=settings["port"],
+                connect_timeout=10,
+            )
+            with connection.cursor() as cursor:
+                # Switch to keckOperations
+                cursor.execute("USE keckOperations;")
+                # Get total row count
+                cursor.execute("SHOW TABLES;")
+                tables = [row[0] for row in cursor.fetchall()]
+                # Try to find the main table (prefer 'staff_schedule' or first table)
+                main_table = None
+                for t in tables:
+                    if t.lower() in ("staff_schedule", "staffschedule", "schedule"):
+                        main_table = t
+                        break
+                if not main_table and tables:
+                    main_table = tables[0]
+                if not main_table:
+                    messagebox.showerror("No tables found", "No tables found in keckOperations database.")
+                    return False
+
+                cursor.execute(f"SELECT COUNT(*) FROM `{main_table}`;")
+                total_rows = cursor.fetchone()[0]
+
+                # Staff type counts
+                type_counts = {}
+                cursor.execute(f"SHOW COLUMNS FROM `{main_table}`;")
+                available_columns = {row[0].lower() for row in cursor.fetchall()}
+                type_column = next(
+                    (
+                        name
+                        for name in ("type", "staff_type", "stafftype", "category")
+                        if name in available_columns
+                    ),
+                    None,
+                )
+                if type_column:
+                    for staff_type in ["na", "oa", "sa", "swoc", "eeoc"]:
+                        cursor.execute(
+                            f"SELECT COUNT(*) FROM `{main_table}` WHERE LOWER(`{type_column}`) LIKE %s;",
+                            (f"%{staff_type}%",),
+                        )
+                        type_counts[staff_type] = cursor.fetchone()[0]
+
+                # Get MySQL version
+                cursor.execute("SELECT VERSION()")
+                version_row = cursor.fetchone()
+                mysql_version = version_row[0] if version_row else "unknown"
+
+            type_summary = (
+                "\n".join(f"{k.upper()}: {v}" for k, v in type_counts.items())
+                if type_counts
+                else "Type breakdown unavailable (no type-like column found)."
+            )
+
+            msg = (
+                f"Connected using [{settings['section']}] {settings['host']}:{settings['port']}\n"
+                f"Server version: {mysql_version}\n\n"
+                f"Database: keckOperations\nTable: {main_table}\n\n"
+                f"Total rows: {total_rows}\n"
+                + type_summary
+            )
+            messagebox.showinfo("MySQL Table Stats", msg)
+
+            # Show the generated INSERT statements from the last SQL file
+            show_insert_statements_preview()
+            
+            # Ask user if they want to apply the inserts
+            apply_choice = messagebox.askyesno(
+                "Apply Inserts",
+                "Apply the INSERT statements to the database?\n\n"
+                "This will:\n"
+                "• Insert new records\n"
+                "• Skip records that already exist (duplicate dates)\n"
+                "• Report statistics"
+            )
+            
+            if apply_choice:
+                # Get the SQL file path
+                data_dir = ensure_data_dir()
+                tracker_file = data_dir / "last_generated_csv_filename.txt"
+                if tracker_file.exists():
+                    csv_stem = tracker_file.read_text(encoding="utf-8").strip().rsplit(".csv", 1)[0]
+                    sql_file = data_dir / f"{csv_stem}.sql"
+                    if sql_file.exists():
+                        # Apply the inserts
+                        stats = apply_insert_statements_to_database(connection, sql_file)
+                        
+                        # Write results to file
+                        result_file = write_insert_results_to_file(stats, sql_file, data_dir)
+                        
+                        # Show results
+                        result_msg = (
+                            f"Database Insert Results\n\n"
+                            f"Total statements: {stats['total']}\n"
+                            f"✓ Inserted successfully: {stats['success']}\n"
+                            f"⊘ Already existed (skipped): {stats['already_exists']}\n"
+                            f"✗ Failed: {stats['failed']}\n\n"
+                            f"Detailed results saved to:\n{result_file.name}"
+                        )
+                        
+                        messagebox.showinfo("Insert Results", result_msg)
+            
+            return True
+        except Exception as error:
+            failures.append(
+                f"[{settings.get('section')}] {settings.get('user')}@{settings.get('host')}:{settings.get('port')} -> {error}"
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+            _stop_ssh_tunnel(tunnel_process)
+
+    messagebox.showerror(
+        "Database connection failed",
+        "Could not connect to the remote MySQL database with any configured profile.\n\n"
+        + "\n".join(failures)
+    )
+    return False
+
+
+def preflight_mysql_connection_check():
+    candidates = get_mysql_connection_candidates()
+    if not candidates:
+        messagebox.showerror(
+            "Missing MySQL settings",
+            "No MySQL connection sections found in config.live.ini.\n"
+            "Expected section: DB_SERVER."
+        )
+        return False
+
+    try:
+        pymysql = importlib.import_module("pymysql")
+    except ImportError:
+        messagebox.showerror(
+            "Missing MySQL client",
+            "PyMySQL is not installed. Install it before trying database import."
+        )
+        return False
+
+    failures = []
+    for settings in candidates:
+        tunnel_process = None
+        missing = [name for name in ("host", "user", "password") if not settings.get(name)]
+        if missing:
+            failures.append(
+                f"[{settings.get('section')}] missing required keys: {', '.join(missing)}"
+            )
+            continue
+
+        connection = None
+        try:
+            tunnel_process = _start_ssh_tunnel(settings)
+            connection = pymysql.connect(
+                host=settings["host"],
+                user=settings["user"],
+                password=settings["password"],
+                port=settings["port"],
+                connect_timeout=5,
+            )
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+            return True
+        except Exception as error:
+            failures.append(
+                f"[{settings.get('section')}] {settings.get('user')}@{settings.get('host')}:{settings.get('port')} -> {error}"
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+            _stop_ssh_tunnel(tunnel_process)
+
+    messagebox.showerror(
+        "Database preflight failed",
+        "Database authentication failed before import.\n\n"
+        "Fix credentials/grants, then rerun this step.\n\n"
+        + "\n".join(failures)
+    )
+    return False
 
 
 def upload_csv_to_staff_site(csv_path, upload_type, verbose_enabled):
@@ -464,15 +994,26 @@ def show_quick_view_instructions(output_path):
     return cancelled[0]
 
 
-def show_final_completion_dialog(output=None, upload_message=None, sql_file=None):
-    dialog = tk.Toplevel()
+def show_final_completion_dialog(output=None, upload_message=None, sql_file=None, parent=None):
+    dialog = tk.Toplevel(parent)
     dialog.title("Conversions Complete")
     dialog.geometry("640x380")
     dialog.resizable(False, False)
 
+    action = [""]
+
+    def continue_to_database():
+        action[0] = "ok"
+        dialog.destroy()
+
+    def cancel():
+        action[0] = "cancel"
+        dialog.destroy()
+
     button_frame = tk.Frame(dialog)
     button_frame.pack(side="bottom", fill="x", pady=(0, 12))
-    tk.Button(button_frame, text="OK", command=dialog.destroy).pack()
+    tk.Button(button_frame, text="OK", command=continue_to_database).pack(side="left", padx=6)
+    tk.Button(button_frame, text="Cancel", command=cancel).pack(side="left", padx=6)
 
     export_section = ""
     if output and upload_message:
@@ -490,11 +1031,17 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
         wraplength=600
     ).pack()
 
+    # When completion is shown, immediately reveal/select the generated SQL file.
+    if sql_file:
+        focus_converted_file(sql_file)
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.lift()
     dialog.focus_force()
     dialog.attributes("-topmost", True)
     dialog.grab_set()
     dialog.wait_window()
+    return action[0]
 
 
 def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=None):
@@ -521,7 +1068,7 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
         if not is_valid_http_url(STAFF_UPLOAD_URL):
             messagebox.showerror(
                 "Invalid upload URL",
-                f"STAFF_UPLOAD_TOOL is missing or invalid in config.live.ini.\nCurrent value: {STAFF_UPLOAD_URL}"
+                f"STAFF_UPLOAD_URL is missing or invalid in config.live.ini.\nCurrent value: {STAFF_UPLOAD_URL}"
             )
             return False
 
@@ -627,7 +1174,24 @@ def main():
         return
     _, output, upload_message, sql_file = result
 
-    show_final_completion_dialog(output=output, upload_message=upload_message, sql_file=sql_file)
+    completion_action = show_final_completion_dialog(
+        output=output,
+        upload_message=upload_message,
+        sql_file=sql_file,
+        parent=root,
+    )
+    if completion_action != "ok":
+        root.destroy()
+        return
+
+    if not preflight_mysql_connection_check():
+        root.destroy()
+        return
+
+    if not connect_to_remote_mysql_db():
+        root.destroy()
+        return
+
     if sql_file:
         focus_converted_file(sql_file)
     root.destroy()
