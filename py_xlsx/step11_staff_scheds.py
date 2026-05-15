@@ -92,20 +92,32 @@ class LegacyTLSAdapter(HTTPAdapter):
         )
 
 
-def _set_dialog_geometry(dialog, width, height, min_width=420, min_height=220):
+def _set_dialog_geometry(
+    dialog,
+    width,
+    height,
+    min_width=420,
+    min_height=220,
+    max_width=None,
+    max_height=None,
+):
     """Clamp dialog size to screen and center it so controls stay visible."""
     screen_width = dialog.winfo_screenwidth()
     screen_height = dialog.winfo_screenheight()
 
-    max_width = max(min_width, screen_width - 80)
-    max_height = max(min_height, screen_height - 120)
+    screen_max_width = max(min_width, screen_width - 80)
+    screen_max_height = max(min_height, screen_height - 120)
 
-    final_width = max(min_width, min(int(width), int(max_width)))
-    final_height = max(min_height, min(int(height), int(max_height)))
+    allowed_max_width = min(screen_max_width, int(max_width)) if max_width else screen_max_width
+    allowed_max_height = min(screen_max_height, int(max_height)) if max_height else screen_max_height
+
+    final_width = max(min_width, min(int(width), int(allowed_max_width)))
+    final_height = max(min_height, min(int(height), int(allowed_max_height)))
 
     pos_x = max(0, (screen_width - final_width) // 2)
     pos_y = max(0, (screen_height - final_height) // 3)
     dialog.geometry(f"{final_width}x{final_height}+{pos_x}+{pos_y}")
+    return final_width, final_height
 
 
 def _estimate_message_dialog_size(text, base_width=760, base_height=380):
@@ -122,7 +134,7 @@ def _estimate_message_dialog_size(text, base_width=760, base_height=380):
 def show_scrollable_text_dialog(title, text):
     dialog = tk.Toplevel()
     dialog.title(title)
-    _set_dialog_geometry(dialog, 1000, 620, min_width=760, min_height=420)
+    _set_dialog_geometry(dialog, 1000, 620, min_width=760, min_height=420, max_width=920)
     dialog.resizable(True, True)
 
     frame = tk.Frame(dialog)
@@ -153,10 +165,17 @@ def show_focused_info_dialog(title, text, parent=None):
     dialog = tk.Toplevel(owner)
     dialog.title(title)
     est_width, est_height = _estimate_message_dialog_size(text)
-    _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
+    final_width, _ = _set_dialog_geometry(
+        dialog,
+        est_width,
+        est_height,
+        min_width=520,
+        min_height=260,
+        max_width=760,
+    )
     dialog.resizable(True, True)
 
-    wrap_length = max(460, min(900, est_width - 40))
+    wrap_length = max(460, min(700, final_width - 40))
     tk.Label(
         dialog,
         text=text,
@@ -182,12 +201,19 @@ def show_focused_yes_no_dialog(title, text, parent=None):
     dialog = tk.Toplevel(owner)
     dialog.title(title)
     est_width, est_height = _estimate_message_dialog_size(text)
-    _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
+    final_width, _ = _set_dialog_geometry(
+        dialog,
+        est_width,
+        est_height,
+        min_width=520,
+        min_height=260,
+        max_width=760,
+    )
     dialog.resizable(True, True)
 
     answer = {"value": False}
 
-    wrap_length = max(460, min(900, est_width - 40))
+    wrap_length = max(460, min(700, final_width - 40))
     tk.Label(
         dialog,
         text=text,
@@ -978,21 +1004,26 @@ def save_insert_statements(response_text, csv_output_path, data_dir):
 
 
 def pick_file(root):
-    root.deiconify()
-    root.lift()
-    root.focus_force()
-    root.attributes("-topmost", True)
-    root.update_idletasks()
+    picker_parent = tk.Toplevel(root)
+    picker_parent.overrideredirect(True)
+    picker_parent.geometry("1x1+0+0")
+    picker_parent.attributes("-alpha", 0.0)
+    picker_parent.attributes("-topmost", True)
+    picker_parent.lift()
+    picker_parent.focus_force()
+    picker_parent.update_idletasks()
 
     try:
         return filedialog.askopenfilename(
-            parent=root,
+            parent=picker_parent,
             title="Select Excel file",
             filetypes=[("Excel files", "*.xlsx *.xls")]
         )
     finally:
-        root.attributes("-topmost", False)
-        root.withdraw()
+        try:
+            picker_parent.destroy()
+        except Exception:
+            pass
 
 def get_sheet_names(file_path):
     xls = pd.ExcelFile(file_path, engine="openpyxl")
@@ -1001,7 +1032,7 @@ def get_sheet_names(file_path):
 def choose_sheet(sheet_names, file_path, default_sheet=None, parent=None):
     dialog = tk.Toplevel(parent)
     dialog.title("Select Sheet to Convert")
-    _set_dialog_geometry(dialog, 820, 360, min_width=660, min_height=300)
+    _set_dialog_geometry(dialog, 820, 360, min_width=660, min_height=300, max_width=760)
     dialog.resizable(True, True)
 
     default_name = default_sheet or sheet_names[0]
@@ -1196,10 +1227,17 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
             export_section += f"Saved SQL file:\n{sql_file}\n\nand is ready for database update.\n\n"
 
     est_width, est_height = _estimate_message_dialog_size(export_section or "Conversions complete.")
-    _set_dialog_geometry(dialog, est_width, est_height, min_width=620, min_height=320)
+    final_width, _ = _set_dialog_geometry(
+        dialog,
+        est_width,
+        est_height,
+        min_width=620,
+        min_height=320,
+        max_width=760,
+    )
 
     if export_section:
-        wrap_length = max(520, min(980, est_width - 40))
+        wrap_length = max(520, min(700, final_width - 40))
         tk.Label(
             dialog,
             text=export_section.rstrip(),
@@ -1310,9 +1348,6 @@ def main():
         return
 
     upload_enabled = True
-    root.destroy()
-
-    root = tk.Tk()
     root.withdraw()
     file_path = pick_file(root)
     if not file_path:
