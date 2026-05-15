@@ -108,7 +108,7 @@ def _set_dialog_geometry(dialog, width, height, min_width=420, min_height=220):
     dialog.geometry(f"{final_width}x{final_height}+{pos_x}+{pos_y}")
 
 
-def _estimate_message_dialog_size(text, base_width=640, base_height=280):
+def _estimate_message_dialog_size(text, base_width=760, base_height=380):
     lines = text.splitlines() or [""]
     longest_line = max((len(line) for line in lines), default=0)
     line_count = len(lines)
@@ -152,7 +152,7 @@ def show_focused_info_dialog(title, text, parent=None):
     owner = parent or getattr(tk, "_default_root", None)
     dialog = tk.Toplevel(owner)
     dialog.title(title)
-    est_width, est_height = _estimate_message_dialog_size(text, base_width=660, base_height=300)
+    est_width, est_height = _estimate_message_dialog_size(text)
     _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
     dialog.resizable(True, True)
 
@@ -181,7 +181,7 @@ def show_focused_yes_no_dialog(title, text, parent=None):
     owner = parent or getattr(tk, "_default_root", None)
     dialog = tk.Toplevel(owner)
     dialog.title(title)
-    est_width, est_height = _estimate_message_dialog_size(text, base_width=660, base_height=300)
+    est_width, est_height = _estimate_message_dialog_size(text)
     _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
     dialog.resizable(True, True)
 
@@ -1123,6 +1123,7 @@ def open_in_calc(file_path, sheet_name):
 
     return subprocess.Popen([
         launcher,
+        "--norestore",
         "--calc",
         file_path
     ])
@@ -1135,11 +1136,27 @@ def close_calc_process(process):
     if process.poll() is not None:
         return
 
+    # On macOS, ask the app to quit first to avoid crash-recovery prompts.
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "LibreOffice" to quit'],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            process.wait(timeout=8)
+            return
+        except Exception:
+            pass
+
     process.terminate()
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=8)
     except subprocess.TimeoutExpired:
-        process.kill()
+        # Do not force-kill; hard kills can trigger LibreOffice recovery on next launch.
+        return
 
 
 def focus_converted_file(file_path):
@@ -1178,7 +1195,7 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
         if sql_file:
             export_section += f"Saved SQL file:\n{sql_file}\n\nand is ready for database update.\n\n"
 
-    est_width, est_height = _estimate_message_dialog_size(export_section or "Conversions complete.", base_width=700, base_height=340)
+    est_width, est_height = _estimate_message_dialog_size(export_section or "Conversions complete.")
     _set_dialog_geometry(dialog, est_width, est_height, min_width=620, min_height=320)
 
     if export_section:
