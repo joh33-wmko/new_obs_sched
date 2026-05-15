@@ -3,7 +3,7 @@
 # This script converts an Excel file to CSV format and optionally uploads it to the staff schedule site.
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import datetime
 import importlib
 import ast
@@ -50,11 +50,33 @@ def load_live_config(config_path=None):
 
 
 LIVE_CONFIG = load_live_config()
+SSH_PASSWORD_CACHE = {}
 
 
 def get_config(section, key, default=None):
     """Get a configuration value from LIVE_CONFIG."""
     return LIVE_CONFIG.get(section, {}).get(key, default)
+
+
+def get_ssh_password(settings):
+    """Get SSH password from cache or prompt user for it."""
+    cache_key = (settings.get("ssh_host"), settings.get("ssh_user"), settings.get("ssh_port"))
+    cached = SSH_PASSWORD_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    parent = getattr(tk, "_default_root", None)
+    display_host = settings.get("ssh_hostname") or settings.get("ssh_host")
+    prompt = (
+        f"Enter SSH password for {settings.get('ssh_user')}@{display_host}"
+        #f" (port {settings.get('ssh_port')})"
+    )
+    password = simpledialog.askstring("SSH Password Required", prompt, show="*", parent=parent)
+    if not password:
+        raise RuntimeError("SSH password entry was cancelled.")
+
+    SSH_PASSWORD_CACHE[cache_key] = password
+    return password
 
 
 class LegacyTLSAdapter(HTTPAdapter):
@@ -70,10 +92,37 @@ class LegacyTLSAdapter(HTTPAdapter):
         )
 
 
+def _set_dialog_geometry(dialog, width, height, min_width=420, min_height=220):
+    """Clamp dialog size to screen and center it so controls stay visible."""
+    screen_width = dialog.winfo_screenwidth()
+    screen_height = dialog.winfo_screenheight()
+
+    max_width = max(min_width, screen_width - 80)
+    max_height = max(min_height, screen_height - 120)
+
+    final_width = max(min_width, min(int(width), int(max_width)))
+    final_height = max(min_height, min(int(height), int(max_height)))
+
+    pos_x = max(0, (screen_width - final_width) // 2)
+    pos_y = max(0, (screen_height - final_height) // 3)
+    dialog.geometry(f"{final_width}x{final_height}+{pos_x}+{pos_y}")
+
+
+def _estimate_message_dialog_size(text, base_width=640, base_height=280):
+    lines = text.splitlines() or [""]
+    longest_line = max((len(line) for line in lines), default=0)
+    line_count = len(lines)
+
+    # Grow width for long lines and height for multiline messages, capped by screen clamp.
+    width = base_width + min(320, max(0, longest_line - 70) * 4)
+    height = base_height + min(300, max(0, line_count - 10) * 14)
+    return width, height
+
+
 def show_scrollable_text_dialog(title, text):
     dialog = tk.Toplevel()
     dialog.title(title)
-    dialog.geometry("900x500")
+    _set_dialog_geometry(dialog, 1000, 620, min_width=760, min_height=420)
     dialog.resizable(True, True)
 
     frame = tk.Frame(dialog)
@@ -97,6 +146,79 @@ def show_scrollable_text_dialog(title, text):
     dialog.attributes("-topmost", True)
     dialog.grab_set()
     dialog.wait_window()
+
+
+def show_focused_info_dialog(title, text, parent=None):
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(title)
+    est_width, est_height = _estimate_message_dialog_size(text, base_width=660, base_height=300)
+    _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
+    dialog.resizable(True, True)
+
+    wrap_length = max(460, min(900, est_width - 40))
+    tk.Label(
+        dialog,
+        text=text,
+        padx=16,
+        pady=16,
+        justify="left",
+        anchor="w",
+        wraplength=wrap_length,
+    ).pack(fill="both", expand=True)
+
+    tk.Button(dialog, text="OK", command=dialog.destroy).pack(pady=(0, 12))
+
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+
+def show_focused_yes_no_dialog(title, text, parent=None):
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(title)
+    est_width, est_height = _estimate_message_dialog_size(text, base_width=660, base_height=300)
+    _set_dialog_geometry(dialog, est_width, est_height, min_width=520, min_height=260)
+    dialog.resizable(True, True)
+
+    answer = {"value": False}
+
+    wrap_length = max(460, min(900, est_width - 40))
+    tk.Label(
+        dialog,
+        text=text,
+        padx=16,
+        pady=16,
+        justify="left",
+        anchor="w",
+        wraplength=wrap_length,
+    ).pack(fill="both", expand=True)
+
+    button_row = tk.Frame(dialog)
+    button_row.pack(pady=(0, 12))
+
+    def choose_yes():
+        answer["value"] = True
+        dialog.destroy()
+
+    def choose_no():
+        answer["value"] = False
+        dialog.destroy()
+
+    tk.Button(button_row, text="Yes", command=choose_yes).pack(side="left", padx=6)
+    tk.Button(button_row, text="No", command=choose_no).pack(side="left", padx=6)
+
+    dialog.protocol("WM_DELETE_WINDOW", choose_no)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+    return answer["value"]
 
 
 def apply_insert_statements_to_database(connection, sql_file):
@@ -177,24 +299,28 @@ def write_insert_results_to_file(stats, sql_file, data_dir):
 def show_insert_statements_preview():
     # Find the last generated SQL file
     data_dir = ensure_data_dir()
+    processed_type = detect_processed_report_type(data_dir)
     tracker_file = data_dir / "last_generated_csv_filename.txt"
     if not tracker_file.exists():
-        messagebox.showwarning("No SQL file", "No last_generated_csv_filename.txt found.")
+        show_focused_info_dialog("No SQL file", "No last_generated_csv_filename.txt found.")
         return
     csv_stem = tracker_file.read_text(encoding="utf-8").strip().rsplit(".csv", 1)[0]
     sql_file = data_dir / f"{csv_stem}.sql"
     if not sql_file.exists():
-        messagebox.showwarning("No SQL file", f"No SQL file found: {sql_file}")
+        show_focused_info_dialog("No SQL file", f"No SQL file found: {sql_file}")
         return
     sql_text = sql_file.read_text(encoding="utf-8")
     # Extract INSERT statements
     statements = extract_insert_statements(sql_text)
     if not statements:
-        messagebox.showinfo("No INSERTs found", f"No INSERT statements found in {sql_file.name}.")
+        show_focused_info_dialog("No INSERTs found", f"No INSERT statements found in {sql_file.name}.")
         return
 
     # Show in a scrollable dialog
-    show_scrollable_text_dialog("Preview INSERT Statements", "\n\n".join(statements))
+    title = "Preview INSERT Statements"
+    if processed_type and processed_type != "UNKNOWN":
+        title = f"Preview {processed_type} INSERT Statements"
+    show_scrollable_text_dialog(title, "\n\n".join(statements))
 
 
 def _clean_header_value(value):
@@ -389,12 +515,12 @@ def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
 def get_mysql_connection_settings(section_name):
     db_config = LIVE_CONFIG.get(section_name, {})
 
-    host = db_config.get("MYSQL_HOST") or db_config.get("DB_HOST")
-    user = db_config.get("DB_USER") or db_config.get("MYSQL_USER")
-    password = db_config.get("DB_PASS") or db_config.get("MYSQL_PASS")
-    database = db_config.get("DB_NAME") or db_config.get("MYSQL_DATABASE")
+    host = db_config.get("DB_HOST")
+    user = db_config.get("DB_USER")
+    password = db_config.get("DB_PASS")
+    database = db_config.get("DB_NAME")
 
-    port_value = db_config.get("MYSQL_PORT") or db_config.get("DB_PORT") or 3306
+    port_value = db_config.get("DB_PORT") or 3306
     try:
         port = int(port_value)
     except (TypeError, ValueError):
@@ -421,6 +547,7 @@ def get_mysql_connection_settings(section_name):
         "port": port,
         "ssh_tunnel_enabled": bool(db_config.get("SSH_HOST") and db_config.get("SSH_USER")),
         "ssh_host": db_config.get("SSH_HOST"),
+        "ssh_hostname": db_config.get("SSH_HOSTNAME"),
         "ssh_user": db_config.get("SSH_USER"),
         "ssh_port": ssh_port,
         "ssh_key_file": db_config.get("SSH_KEY_FILE") or LIVE_CONFIG.get("SSH_KEY_FILE"),
@@ -459,15 +586,8 @@ def _start_ssh_tunnel(settings):
     sshpass_available = shutil.which("sshpass") is not None
     
     if sshpass_available:
-        # Use sshpass to automate password entry
-        # For SSH tunnel, we need MYSQL_PASS (SSH user password), not DB_PASS
-        db_config = LIVE_CONFIG.get(settings.get("section", "DB_SERVER"), {})
-        ssh_password = db_config.get("MYSQL_PASS") or ""
-        if not ssh_password:
-            raise RuntimeError(
-                "SSH password automation enabled (sshpass found) but no MYSQL_PASS in config.\n"
-                "Set MYSQL_PASS in DB_SERVER section for SSH authentication."
-            )
+        # Use sshpass with a runtime password prompt.
+        ssh_password = get_ssh_password(settings)
         
         command = [
             "sshpass",
@@ -544,7 +664,7 @@ def _start_ssh_tunnel(settings):
     raise RuntimeError(
         f"SSH tunnel did not open local port {local_port} within {max_wait_iterations * 0.5:.0f}s.\n"
         "The SSH process may have encountered an authentication issue.\n"
-        "Check MYSQL_PASS in config and retry."
+        "Verify SSH password and connectivity, then retry."
     )
 
 
@@ -570,7 +690,7 @@ def get_mysql_connection_candidates():
 def connect_to_remote_mysql_db():
     candidates = get_mysql_connection_candidates()
     if not candidates:
-        messagebox.showerror(
+        show_focused_info_dialog(
             "Missing MySQL settings",
             "No MySQL connection sections found in config.live.ini.\n"
             "Expected section: DB_SERVER."
@@ -580,7 +700,7 @@ def connect_to_remote_mysql_db():
     try:
         pymysql = importlib.import_module("pymysql")
     except ImportError:
-        messagebox.showerror(
+        show_focused_info_dialog(
             "Missing MySQL client",
             "PyMySQL is not installed. Install it before trying to connect to the remote MySQL database."
         )
@@ -622,7 +742,7 @@ def connect_to_remote_mysql_db():
                 if not main_table and tables:
                     main_table = tables[0]
                 if not main_table:
-                    messagebox.showerror("No tables found", f"No tables found in {db_name} database.")
+                    show_focused_info_dialog("No tables found", f"No tables found in {db_name} database.")
                     return False
 
                 total_rows, type_counts = fetch_db_snapshot(
@@ -644,21 +764,21 @@ def connect_to_remote_mysql_db():
             )
 
             msg = (
-                f"Connected using [{settings['section']}] {settings['host']}:{settings['port']}\n"
-                f"Server version: {mysql_version}\n\n"
+                f"Connected using {settings['section']} tunnel {settings['host']}:{settings['port']}\n"
+                f"MySQL Server version: {mysql_version}\n\n"
                 f"Database: {db_name}\nTable: {main_table}\n\n"
                 f"Total rows: {total_rows}\n"
                 + type_summary
             )
-            messagebox.showinfo("MySQL Table Stats", msg)
+            show_focused_info_dialog("Current MySQL Table Stats", msg, parent=getattr(tk, "_default_root", None))
             write_db_report(msg, "BEFORE_INSERT", ensure_data_dir())
 
             # Show the generated INSERT statements from the last SQL file
             show_insert_statements_preview()
             
             # Ask user if they want to apply the inserts
-            apply_choice = messagebox.askyesno(
-                "Apply Inserts",
+            apply_choice = show_focused_yes_no_dialog(
+                "Apply INSERTs Info",
                 "Apply the INSERT statements to the database?\n\n"
                 "This will:\n"
                 "• Insert new records\n"
@@ -707,14 +827,14 @@ def connect_to_remote_mysql_db():
                             f"⊘ Already existed (skipped): {stats['already_exists']}\n"
                             f"✗ Failed: {stats['failed']}\n\n"
                             f"After Insert Snapshot\n"
-                            f"Table: {main_table}\n"
+                            f"Table: {main_table}\n\n"
                             f"Total rows: {post_total_rows}\n"
                             f"{post_type_summary}\n\n"
                             f"Detailed results saved to:\n{result_file.name}\n"
                             f"{end_delimiter}"
                         )
                         
-                        messagebox.showinfo("Insert Results", result_msg)
+                        show_focused_info_dialog("Insert Results", result_msg)
                         write_db_report(result_msg, "AFTER_INSERT", ensure_data_dir())
             
             return True
@@ -727,7 +847,7 @@ def connect_to_remote_mysql_db():
                 connection.close()
             _stop_ssh_tunnel(tunnel_process)
 
-    messagebox.showerror(
+    show_focused_info_dialog(
         "Database connection failed",
         "Could not connect to the remote MySQL database with any configured profile.\n\n"
         + "\n".join(failures)
@@ -738,7 +858,7 @@ def connect_to_remote_mysql_db():
 def preflight_mysql_connection_check():
     candidates = get_mysql_connection_candidates()
     if not candidates:
-        messagebox.showerror(
+        show_focused_info_dialog(
             "Missing MySQL settings",
             "No MySQL connection sections found in config.live.ini.\n"
             "Expected section: DB_SERVER."
@@ -748,7 +868,7 @@ def preflight_mysql_connection_check():
     try:
         pymysql = importlib.import_module("pymysql")
     except ImportError:
-        messagebox.showerror(
+        show_focused_info_dialog(
             "Missing MySQL client",
             "PyMySQL is not installed. Install it before trying database import."
         )
@@ -788,7 +908,7 @@ def preflight_mysql_connection_check():
                 connection.close()
             _stop_ssh_tunnel(tunnel_process)
 
-    messagebox.showerror(
+    show_focused_info_dialog(
         "Database preflight failed",
         "Database authentication failed before import.\n\n"
         "Fix credentials/grants, then rerun this step.\n\n"
@@ -858,11 +978,21 @@ def save_insert_statements(response_text, csv_output_path, data_dir):
 
 
 def pick_file(root):
-    return filedialog.askopenfilename(
-        parent=root,
-        title="Select Excel file",
-        filetypes=[("Excel files", "*.xlsx *.xls")]
-    )
+    root.deiconify()
+    root.lift()
+    root.focus_force()
+    root.attributes("-topmost", True)
+    root.update_idletasks()
+
+    try:
+        return filedialog.askopenfilename(
+            parent=root,
+            title="Select Excel file",
+            filetypes=[("Excel files", "*.xlsx *.xls")]
+        )
+    finally:
+        root.attributes("-topmost", False)
+        root.withdraw()
 
 def get_sheet_names(file_path):
     xls = pd.ExcelFile(file_path, engine="openpyxl")
@@ -871,8 +1001,8 @@ def get_sheet_names(file_path):
 def choose_sheet(sheet_names, file_path, default_sheet=None, parent=None):
     dialog = tk.Toplevel(parent)
     dialog.title("Select Sheet to Convert")
-    dialog.geometry("700x320")
-    dialog.resizable(False, False)
+    _set_dialog_geometry(dialog, 820, 360, min_width=660, min_height=300)
+    dialog.resizable(True, True)
 
     default_name = default_sheet or sheet_names[0]
     selected = tk.StringVar(master=dialog, value=default_name)
@@ -918,8 +1048,8 @@ def confirm_staff_type_dialog(staff_type, file_path, parent=None):
     """Show detected staff type and let user confirm before proceeding."""
     dialog = tk.Toplevel(parent)
     dialog.title("Confirm Staff Type")
-    dialog.geometry("500x200")
-    dialog.resizable(False, False)
+    _set_dialog_geometry(dialog, 560, 280, min_width=500, min_height=240)
+    dialog.resizable(True, True)
 
     staff_type_display = staff_type.upper() if staff_type else "UNKNOWN"
     cancelled = [False]
@@ -969,7 +1099,7 @@ def apply_staff_type_processing(df, staff_type):
     if staff_type_lower == "na":
         # NA-specific: ensure Date column exists (schedule format)
         if "Date" not in df.columns:
-            messagebox.showwarning(
+            show_focused_info_dialog(
                 "Invalid NA file",
                 "NA schedule files must contain a 'Date' column."
             )
@@ -985,17 +1115,31 @@ def apply_staff_type_processing(df, staff_type):
 def open_in_calc(file_path, sheet_name):
     launcher = shutil.which("libreoffice") or shutil.which("soffice")
     if not launcher:
-        messagebox.showerror(
+        show_focused_info_dialog(
             "LibreOffice not found",
             "Could not find LibreOffice.\nInstall LibreOffice or add it to PATH."
         )
-        return
+        return None
 
-    subprocess.Popen([
+    return subprocess.Popen([
         launcher,
         "--calc",
         file_path
     ])
+
+
+def close_calc_process(process):
+    if process is None:
+        return
+
+    if process.poll() is not None:
+        return
+
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 
 def focus_converted_file(file_path):
@@ -1010,8 +1154,7 @@ def focus_converted_file(file_path):
 def show_final_completion_dialog(output=None, upload_message=None, sql_file=None, parent=None):
     dialog = tk.Toplevel(parent)
     dialog.title("Conversions Complete")
-    dialog.geometry("640x380")
-    dialog.resizable(False, False)
+    dialog.resizable(True, True)
 
     action = [""]
 
@@ -1033,16 +1176,21 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
         export_section = f"{upload_message}\n\n"
         export_section += f"Converted CSV file:\n{output}\n\n"
         if sql_file:
-            export_section += f"Saved SQL file:\n{sql_file}\n\n"
+            export_section += f"Saved SQL file:\n{sql_file}\n\nand is ready for database update.\n\n"
 
-    tk.Label(
-        dialog,
-        text=f"{export_section}Keep this window open while you:\n > Use the Space bar for quick view (toggle)\n > Edit to remove any overlapping dates in the SQL file and Save\n\nThen return here and click OK to proceed to run the database imports.",
-        padx=16,
-        pady=20,
-        justify="left",
-        wraplength=600
-    ).pack()
+    est_width, est_height = _estimate_message_dialog_size(export_section or "Conversions complete.", base_width=700, base_height=340)
+    _set_dialog_geometry(dialog, est_width, est_height, min_width=620, min_height=320)
+
+    if export_section:
+        wrap_length = max(520, min(980, est_width - 40))
+        tk.Label(
+            dialog,
+            text=export_section.rstrip(),
+            padx=16,
+            pady=20,
+            justify="left",
+            wraplength=wrap_length
+        ).pack()
 
     # When completion is shown, immediately reveal/select the generated SQL file.
     if sql_file:
@@ -1080,7 +1228,7 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
     if upload_enabled:
         upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
         if not upload_url:
-            messagebox.showerror(
+            show_focused_info_dialog(
                 "Invalid upload URL",
                 "STAFF_UPLOAD_URL is missing in config.live.ini"
             )
@@ -1166,7 +1314,7 @@ def main():
     sheets = get_sheet_names(copied_file_path)
 
     # Open spreadsheet visually
-    open_in_calc(copied_file_path, sheets[0])
+    calc_process = open_in_calc(copied_file_path, sheets[0])
 
     # Let user choose
     chosen_sheet = choose_sheet(
@@ -1192,6 +1340,8 @@ def main():
         sql_file=sql_file,
         parent=root,
     )
+    close_calc_process(calc_process)
+
     if completion_action != "ok":
         root.destroy()
         return
