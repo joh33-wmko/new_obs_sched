@@ -23,8 +23,13 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
+# Allow importing shared utilities from project root when running from s11_staff_scheds/.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 def load_live_config(config_path=None):
-    config_file = Path(config_path) if config_path else Path.cwd() / "config.live.ini"
+    config_file = Path(config_path) if config_path else PROJECT_ROOT / "common" / "config.live.ini"
     if not config_file.exists():
         return {}
 
@@ -452,7 +457,7 @@ def build_output_filename(file_path):
 
 
 def ensure_data_dir():
-    data_dir = Path.cwd() / "data"
+    data_dir = PROJECT_ROOT / "data"
     data_dir.mkdir(exist_ok=True)
     return data_dir
 
@@ -718,7 +723,7 @@ def connect_to_remote_mysql_db():
     if not candidates:
         show_focused_info_dialog(
             "Missing MySQL settings",
-            "No MySQL connection sections found in config.live.ini.\n"
+            "No MySQL connection sections found in common/config.live.ini.\n"
             "Expected section: DB_SERVER."
         )
         return False
@@ -886,7 +891,7 @@ def preflight_mysql_connection_check():
     if not candidates:
         show_focused_info_dialog(
             "Missing MySQL settings",
-            "No MySQL connection sections found in config.live.ini.\n"
+            "No MySQL connection sections found in common/config.live.ini.\n"
             "Expected section: DB_SERVER."
         )
         return False
@@ -1285,7 +1290,7 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
         if not upload_url:
             show_focused_info_dialog(
                 "Invalid upload URL",
-                "STAFF_UPLOAD_URL is missing in config.live.ini"
+                "STAFF_UPLOAD_URL is missing in common/config.live.ini"
             )
             return False
 
@@ -1310,29 +1315,440 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
 
     return True, output, upload_message, sql_file
 
+
+# ============================================================================
+# SWOC Rotation Management Functions
+# ============================================================================
+
+def load_swoc_members():
+    """Load SWOC team members from config."""
+    members = get_config("SWOC_ROTATION", "MEMBERS", [])
+    if not isinstance(members, list):
+        return []
+
+    normalized = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        # Backward compatibility: migrate legacy "initials" to "alias" in-memory.
+        if "alias" not in member and "initials" in member:
+            member = dict(member)
+            member["alias"] = member.get("initials")
+            member.pop("initials", None)
+        normalized.append(member)
+    return normalized
+
+
+def save_swoc_members(members):
+    """Save SWOC team members back to config file by patching only the MEMBERS list."""
+    config_file = PROJECT_ROOT / "common" / "config.live.ini"
+    if not config_file.exists():
+        return False
+
+    content = config_file.read_text(encoding="utf-8")
+
+    # Render the new MEMBERS list as indented Python literals
+    indent = "    "
+    item_lines = []
+    for m in members:
+        item_lines.append(f"{indent}  {{")
+        for k, v in m.items():
+            item_lines.append(f'{indent}    "{k}": {repr(v)},')
+        # Remove trailing comma from last key
+        item_lines[-1] = item_lines[-1].rstrip(",")
+        item_lines.append(f"{indent}  }},")
+    if item_lines:
+        item_lines[-1] = item_lines[-1].rstrip(",")
+    members_block = "\n".join(item_lines)
+
+    new_section = f'{indent}"MEMBERS": [\n{members_block}\n{indent}]'
+
+    # Replace existing MEMBERS block using a regex that finds "MEMBERS": [ ... ]
+    import re as _re
+    pattern = _re.compile(
+        r'"MEMBERS"\s*:\s*\[.*?\]',
+        _re.DOTALL,
+    )
+    if pattern.search(content):
+        new_content = pattern.sub(new_section.strip(), content, count=1)
+    else:
+        # Append before closing brace of SWOC_ROTATION if MEMBERS key is missing
+        new_content = content.rstrip().rstrip("}").rstrip() + f',\n{new_section}\n  }}\n}}\n'
+
+    config_file.write_text(new_content, encoding="utf-8")
+
+    global LIVE_CONFIG
+    LIVE_CONFIG = load_live_config()
+    return True
+
+
+def add_swoc_audit_log_entry(change_type, member_name, old_values, new_values, reason=""):
+    """Write an entry to the SWOC rotation audit log."""
+    data_dir = ensure_data_dir()
+    audit_file = data_dir / "swoc_rotation_audit.log"
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = (
+        f"[{timestamp}] {change_type}\n"
+        f"  Member: {member_name}\n"
+    )
+    
+    if old_values:
+        entry += f"  Old values: {old_values}\n"
+    if new_values:
+        entry += f"  New values: {new_values}\n"
+    if reason:
+        entry += f"  Reason: {reason}\n"
+    
+    entry += "\n"
+    
+    with open(audit_file, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+
+def show_member_edit_dialog(member_name, member_data, parent=None):
+    """
+    Show a form to edit a SWOC member's lifecycle dates.
+    Returns updated member dict or None if cancelled.
+    """
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(f"Edit Member: {member_name}")
+    _set_dialog_geometry(dialog, 500, 420, min_width=420, min_height=360)
+    dialog.resizable(False, False)
+    
+    result = {"updated": False, "data": None}
+    
+    # Create a frame with padding
+    main_frame = tk.Frame(dialog, padx=12, pady=12)
+    main_frame.pack(fill="both", expand=True)
+    
+    # Helper to create labeled entry fields
+    fields = {}
+    
+    def create_date_field(label_text, initial_value, row):
+        tk.Label(main_frame, text=label_text + ":").grid(row=row, column=0, sticky="w", pady=4)
+        entry = tk.Entry(main_frame, width=18)
+        entry.insert(0, initial_value or "")
+        entry.grid(row=row, column=1, sticky="ew", pady=4, padx=(8, 0))
+        return entry
+    
+    def create_bool_field(label_text, initial_value, row, command=None):
+        tk.Label(main_frame, text=label_text + ":").grid(row=row, column=0, sticky="w", pady=4)
+        var = tk.BooleanVar(value=initial_value)
+        if command is None:
+            check = tk.Checkbutton(main_frame, variable=var)
+        else:
+            check = tk.Checkbutton(main_frame, variable=var, command=command)
+        check.grid(row=row, column=1, sticky="w", pady=4, padx=(8, 0))
+        return var
+    
+    # Create fields
+    fields["service_start_date"] = create_date_field(
+        "Service Start Date (YYYY-MM-DD)", 
+        member_data.get("service_start_date"), 0
+    )
+    fields["service_end_date"] = create_date_field(
+        "Service End Date (YYYY-MM-DD)", 
+        member_data.get("service_end_date"), 1
+    )
+    fields["rotation_start_date"] = create_date_field(
+        "Rotation Start Date (YYYY-MM-DD)", 
+        member_data.get("rotation_start_date"), 3
+    )
+    fields["rotation_end_date"] = create_date_field(
+        "Rotation End Date (YYYY-MM-DD)", 
+        member_data.get("rotation_end_date"), 4
+    )
+
+    initial_active = bool(member_data.get("active", True))
+
+    def on_active_toggle():
+        current_active = fields["active"].get()
+        if current_active == initial_active:
+            return
+
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        if current_active:
+            fields["rotation_start_date"].delete(0, "end")
+            fields["rotation_start_date"].insert(0, today_str)
+            fields["rotation_end_date"].delete(0, "end")
+        else:
+            fields["rotation_end_date"].delete(0, "end")
+            fields["rotation_end_date"].insert(0, today_str)
+            fields["rotation_start_date"].delete(0, "end")
+
+    fields["active"] = create_bool_field(
+        "Active in Rotation",
+        initial_active,
+        2,
+        command=on_active_toggle,
+    )
+    
+    # Instructions
+    instr = tk.Label(
+        main_frame,
+        text="Leave blank for null dates. Dates are YYYY-MM-DD format.",
+        font=("Arial", 9),
+        fg="gray"
+    )
+    instr.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    
+    # Buttons
+    button_frame = tk.Frame(main_frame)
+    button_frame.grid(row=6, column=0, columnspan=2, pady=(12, 0))
+    
+    def save_changes():
+        original_service_end = member_data.get("service_end_date") or ""
+        new_service_end = (fields["service_end_date"].get() or "").strip()
+
+        updated = {
+            "name": member_data["name"],
+            "alias": member_data.get("alias") or member_data.get("initials"),
+            "service_start_date": fields["service_start_date"].get() or None,
+            "service_end_date": new_service_end or None,
+            "active": fields["active"].get(),
+            "rotation_start_date": fields["rotation_start_date"].get() or None,
+            "rotation_end_date": fields["rotation_end_date"].get() or None,
+        }
+
+        # If service end date changed to a non-empty value, force rotation to end on that date.
+        if new_service_end and new_service_end != original_service_end:
+            updated["active"] = False
+            updated["rotation_start_date"] = None
+            updated["rotation_end_date"] = new_service_end
+
+        result["data"] = updated
+        result["updated"] = True
+        dialog.destroy()
+    
+    def cancel_edit():
+        dialog.destroy()
+    
+    tk.Button(button_frame, text="Save", command=save_changes, width=10).pack(side="left", padx=4)
+    tk.Button(button_frame, text="Cancel", command=cancel_edit, width=10).pack(side="left", padx=4)
+    
+    main_frame.columnconfigure(1, weight=1)
+    
+    dialog.protocol("WM_DELETE_WINDOW", cancel_edit)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+    
+    return result["data"] if result["updated"] else None
+
+
+def show_member_management_dialog(parent=None):
+    """
+    Show a dialog to manage SWOC team members.
+    Allows viewing, editing, adding members.
+    """
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title("SWOC Team Member Management")
+    _set_dialog_geometry(dialog, 620, 480, min_width=520, min_height=380)
+    dialog.resizable(True, True)
+    
+    members = load_swoc_members()
+    
+    # Create a frame with scrollbar
+    main_frame = tk.Frame(dialog)
+    main_frame.pack(fill="both", expand=True, padx=8, pady=8)
+    
+    # Header
+    tk.Label(
+        main_frame,
+        text="Team Members",
+        font=("Arial", 12, "bold")
+    ).pack(anchor="w", pady=(0, 8))
+    
+    # Listbox with members
+    list_frame = tk.Frame(main_frame)
+    list_frame.pack(fill="both", expand=True, pady=(0, 8))
+    
+    scrollbar = tk.Scrollbar(list_frame)
+    scrollbar.pack(side="right", fill="y")
+    
+    listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, height=12)
+    listbox.pack(side="left", fill="both", expand=True)
+    scrollbar.config(command=listbox.yview)
+    
+    # Populate listbox
+    for i, member in enumerate(members):
+        active_status = "✓" if member.get("active") else "✗"
+        display_text = f"{member['name']} ({member.get('alias', '')}) [{active_status}]"
+        listbox.insert(i, display_text)
+    
+    def refresh_listbox():
+        listbox.delete(0, "end")
+        for i, member in enumerate(members):
+            active_status = "✓" if member.get("active") else "✗"
+            display_text = f"{member['name']} ({member.get('alias', '')}) [{active_status}]"
+            listbox.insert(i, display_text)
+
+    # Buttons
+    button_frame = tk.Frame(main_frame)
+    button_frame.pack(fill="x", pady=(0, 8))
+
+    def add_new_member():
+        blank = {
+            "name": "",
+            "alias": "",
+            "service_start_date": datetime.date.today().isoformat(),
+            "service_end_date": None,
+            "active": True,
+            "rotation_start_date": datetime.date.today().isoformat(),
+            "rotation_end_date": None,
+        }
+        # Show a small dialog to collect name + alias first
+        owner2 = dialog
+        name_dialog = tk.Toplevel(owner2)
+        name_dialog.title("New Member")
+        _set_dialog_geometry(name_dialog, 380, 200, min_width=320, min_height=180)
+        name_dialog.resizable(False, False)
+
+        name_result = {"ok": False}
+        nf = tk.Frame(name_dialog, padx=12, pady=12)
+        nf.pack(fill="both", expand=True)
+
+        tk.Label(nf, text="Full Name:").grid(row=0, column=0, sticky="w", pady=4)
+        name_entry = tk.Entry(nf, width=24)
+        name_entry.grid(row=0, column=1, sticky="ew", pady=4, padx=(8, 0))
+
+        tk.Label(nf, text="Alias:").grid(row=1, column=0, sticky="w", pady=4)
+        alias_entry = tk.Entry(nf, width=12)
+        alias_entry.grid(row=1, column=1, sticky="w", pady=4, padx=(8, 0))
+
+        bf2 = tk.Frame(nf)
+        bf2.grid(row=2, column=0, columnspan=2, pady=(10, 0))
+
+        def confirm_name():
+            n = name_entry.get().strip()
+            alias = alias_entry.get().strip()
+            if not n or not alias:
+                show_focused_info_dialog("Required", "Name and alias are required.", name_dialog)
+                return
+            blank["name"] = n
+            blank["alias"] = alias
+            name_result["ok"] = True
+            name_dialog.destroy()
+
+        def cancel_name():
+            name_dialog.destroy()
+
+        tk.Button(bf2, text="Next", command=confirm_name, width=8).pack(side="left", padx=4)
+        tk.Button(bf2, text="Cancel", command=cancel_name, width=8).pack(side="left", padx=4)
+        nf.columnconfigure(1, weight=1)
+        name_dialog.protocol("WM_DELETE_WINDOW", cancel_name)
+        name_dialog.lift()
+        name_dialog.focus_force()
+        name_dialog.attributes("-topmost", True)
+        name_dialog.grab_set()
+        name_dialog.wait_window()
+
+        if not name_result["ok"]:
+            return
+
+        updated = show_member_edit_dialog(blank["name"], blank, dialog)
+        if updated:
+            members.append(updated)
+            save_swoc_members(members)
+            add_swoc_audit_log_entry(
+                "MEMBER_ADDED",
+                updated["name"],
+                None,
+                str(updated),
+                "via member management interface",
+            )
+            refresh_listbox()
+            show_focused_info_dialog("Success", f"{updated['name']} added and logged to audit trail.", dialog)
+
+    def edit_member():
+        selection = listbox.curselection()
+        if not selection:
+            show_focused_info_dialog("No Selection", "Please select a member to edit.", dialog)
+            return
+        
+        idx = selection[0]
+        member_to_edit = members[idx]
+        
+        updated = show_member_edit_dialog(
+            member_to_edit["name"],
+            member_to_edit,
+            dialog
+        )
+        
+        if updated:
+            old_member = members[idx]
+            members[idx] = updated
+            save_swoc_members(members)
+            add_swoc_audit_log_entry(
+                "MEMBER_UPDATED",
+                updated["name"],
+                str(old_member),
+                str(updated),
+                "via member management interface",
+            )
+            refresh_listbox()
+            show_focused_info_dialog("Success", "Member updated and logged to audit trail.", dialog)
+
+    tk.Button(button_frame, text="Add New", command=add_new_member).pack(side="left", padx=4)
+    tk.Button(button_frame, text="Edit Selected", command=edit_member).pack(side="left", padx=4)
+    tk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right", padx=4)
+    
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+
 def main():
     root = tk.Tk()
     root.title("Step 11: Publish Staff Schedule")
-    root.geometry("640x280")
+    root.geometry("640x320")
     root.resizable(False, False)
     startup_action = tk.StringVar(value="")
+    mode_var = tk.StringVar(value="excel")
 
     tk.Label(
         root,
-        text="Generates two types of SQL command files:\n\n > From Excel Sheets provided for SA, OA, and NA\n> Continuing sequence rotation for SWOC staff\n\nThen updates the Night Staff Schedule database\n\nSelect the Excel file to process",
+        text="Night Staff Schedule — Choose workflow:",
         padx=16,
-        pady=16
-    ).pack()
+        pady=12,
+        font=("Arial", 11, "bold"),
+    ).pack(anchor="w")
 
-    def select_file():
-        startup_action.set("select")
+    radio_frame = tk.Frame(root, padx=24)
+    radio_frame.pack(anchor="w", pady=4)
+    tk.Radiobutton(
+        radio_frame, text="SA / OA / NA — Import from Excel file", variable=mode_var, value="excel"
+    ).pack(anchor="w", pady=2)
+    tk.Radiobutton(
+        radio_frame, text="SWOC — Generate rotation schedule", variable=mode_var, value="swoc"
+    ).pack(anchor="w", pady=2)
+
+    tk.Label(
+        root,
+        text="Both workflows generate SQL INSERT statements\nand update the Night Staff Schedule database.",
+        padx=16,
+        pady=8,
+        justify="left",
+        fg="gray",
+    ).pack(anchor="w")
+
+    def select_mode():
+        startup_action.set(mode_var.get())
 
     def cancel_startup():
         startup_action.set("cancel")
 
     button_frame = tk.Frame(root)
     button_frame.pack(pady=10)
-    tk.Button(button_frame, text="OK", command=select_file).pack(side="left", padx=6)
+    tk.Button(button_frame, text="OK", command=select_mode).pack(side="left", padx=6)
     tk.Button(button_frame, text="Cancel", command=cancel_startup).pack(side="left", padx=6)
 
     root.protocol("WM_DELETE_WINDOW", cancel_startup)
@@ -1343,10 +1759,20 @@ def main():
     root.update()
 
     root.wait_variable(startup_action)
-    if startup_action.get() != "select":
+    chosen_mode = startup_action.get()
+    if chosen_mode == "cancel":
         root.destroy()
         return
 
+    # ── SWOC mode ──────────────────────────────────────────────────────────
+    if chosen_mode == "swoc":
+        # Iconify instead of withdraw so the dialog has a live parent on macOS
+        root.iconify()
+        show_member_management_dialog(parent=root)
+        root.destroy()
+        return
+
+    # ── Excel import mode (SA / OA / NA) ───────────────────────────────────
     upload_enabled = True
     root.withdraw()
     file_path = pick_file(root)
