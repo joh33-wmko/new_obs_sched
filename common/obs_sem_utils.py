@@ -28,6 +28,71 @@ def semester_token_from_date(value):
     return f"{year}B"
 
 
+def _normalize_semester_token(stem):
+    match = re.search(r"(?<!\d)(\d{2}|\d{4})\s*([abAB])(?![A-Za-z0-9])", stem)
+    if not match:
+        return None
+
+    year = match.group(1)
+    semester = match.group(2).upper()
+    if len(year) == 2:
+        year = f"20{year}"
+
+    return f"{year}{semester}"
+
+
+def _normalize_staff_type(stem):
+    match = re.search(r"(?<![A-Za-z0-9])(OA|NA|SA)(?![A-Za-z0-9])", stem, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    return match.group(1).upper()
+
+
+def _normalize_month_range(stem):
+    month_pattern = (
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    )
+    match = re.search(rf"{month_pattern}\s*-\s*{month_pattern}", stem, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    month_map = {
+        "jan": "Jan",
+        "feb": "Feb",
+        "mar": "Mar",
+        "apr": "Apr",
+        "may": "May",
+        "jun": "Jun",
+        "jul": "Jul",
+        "aug": "Aug",
+        "sep": "Sep",
+        "oct": "Oct",
+        "nov": "Nov",
+        "dec": "Dec",
+    }
+
+    start = month_map[match.group(1)[:3].lower()]
+    end = month_map[match.group(2)[:3].lower()]
+    return f"{start}-{end}"
+
+
+def build_output_filename(file_path):
+    stem = Path(file_path).stem
+    semester = _normalize_semester_token(stem)
+    staff_type = _normalize_staff_type(stem)
+    month_range = _normalize_month_range(stem)
+
+    if semester and staff_type:
+        filename = f"{semester}_{staff_type}_Schedule"
+        if month_range:
+            filename = f"{filename}_{month_range}"
+        return f"{filename}.csv"
+
+    return f"{Path(file_path).stem}.csv"
+
+
 def update_config_sems(config_path=None, year=None):
     """Update SWOC semester ranges in config.live.ini.
 
