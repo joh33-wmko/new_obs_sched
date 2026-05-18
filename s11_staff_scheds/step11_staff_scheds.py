@@ -37,6 +37,16 @@ from common.obs_sem_utils import (
     store_last_csv_filename,
     load_live_config,
 )
+from common.db_tunnel_utils import (
+    _is_tcp_port_open,
+    _start_ssh_tunnel,
+    _stop_ssh_tunnel,
+    fetch_db_snapshot,
+    apply_insert_statements_to_database,
+    write_insert_results_to_file,
+    extract_insert_statements,
+    save_insert_statements,
+)
 
 
 LIVE_CONFIG = load_live_config()
@@ -237,79 +247,8 @@ def show_focused_yes_no_dialog(title, text, parent=None):
     return answer["value"]
 
 
-def apply_insert_statements_to_database(connection, sql_file):
-    """Execute INSERT statements from SQL file and track results."""
-    stats = {
-        'total': 0,
-        'success': 0,
-        'failed': 0,
-        'already_exists': 0,
-        'statements': []  # List of (statement, status, error) tuples
-    }
-    
-    sql_text = sql_file.read_text(encoding="utf-8")
-    statements = extract_insert_statements(sql_text)
-    
-    if not statements:
-        stats['total'] = 0
-        return stats
-    
-    cursor = connection.cursor()
-    try:
-        for stmt in statements:
-            stats['total'] += 1
-            status = None
-            error_msg = None
-            
-            try:
-                cursor.execute(stmt)
-                connection.commit()
-                stats['success'] += 1
-                status = 'SUCCESS'
-            except Exception as e:
-                error_msg = str(e)
-                # Check if it's a duplicate key error (already exists)
-                if 'Duplicate entry' in error_msg or 'duplicate' in error_msg.lower():
-                    stats['already_exists'] += 1
-                    status = 'DUPLICATE'
-                else:
-                    stats['failed'] += 1
-                    status = 'FAILED'
-            
-            stats['statements'].append((stmt, status, error_msg))
-    finally:
-        cursor.close()
-    
-    return stats
 
 
-def write_insert_results_to_file(stats, sql_file, data_dir):
-    """Write INSERT execution results to a detailed report file."""
-    result_file = data_dir / f"{sql_file.stem}_results.txt"
-    
-    with open(result_file, 'w', encoding='utf-8') as f:
-        f.write("=" * 80 + "\n")
-        f.write("DATABASE INSERT EXECUTION RESULTS\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write("SUMMARY\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"Total Statements: {stats['total']}\n")
-        f.write(f"✓ Inserted Successfully: {stats['success']}\n")
-        f.write(f"⊘ Already Existed (Skipped): {stats['already_exists']}\n")
-        f.write(f"✗ Failed: {stats['failed']}\n\n")
-        
-        f.write("DETAILED RESULTS\n")
-        f.write("-" * 80 + "\n\n")
-        
-        for idx, (stmt, status, error) in enumerate(stats['statements'], 1):
-            f.write(f"[{idx}/{stats['total']}] {status}\n")
-            f.write(f"  {stmt[:100]}{'...' if len(stmt) > 100 else ''}\n")
-            if error:
-                f.write(f"  ERROR: {error[:150]}{'...' if len(error) > 150 else ''}\n")
-            f.write("\n")
-    
-    return result_file
 
 
 def show_insert_statements_preview():
@@ -402,28 +341,6 @@ def detect_processed_report_type(data_dir):
     return match.group(1).upper() if match else "UNKNOWN"
 
 
-def fetch_db_snapshot(cursor, main_table, type_columns, staff_types):
-    """Fetch total rows and per-type counts for a table snapshot."""
-    cursor.execute(f"SELECT COUNT(*) FROM `{main_table}`;")
-    total_rows = cursor.fetchone()[0]
-
-    type_counts = {}
-    cursor.execute(f"SHOW COLUMNS FROM `{main_table}`;")
-    available_columns = {row[0].lower() for row in cursor.fetchall()}
-    type_column = next(
-        (name for name in type_columns if name.lower() in available_columns),
-        None,
-    )
-
-    if type_column:
-        for staff_type in staff_types:
-            cursor.execute(
-                f"SELECT COUNT(*) FROM `{main_table}` WHERE LOWER(`{type_column}`) LIKE %s;",
-                (f"%{staff_type}%",),
-            )
-            type_counts[staff_type] = cursor.fetchone()[0]
-
-    return total_rows, type_counts
 
 
 def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
@@ -485,127 +402,8 @@ def get_mysql_connection_settings(section_name):
     }
 
 
-def _is_tcp_port_open(host, port, timeout=1.0):
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
-def _start_ssh_tunnel(settings):
-    if not settings.get("ssh_tunnel_enabled"):
-        return None
-
-    local_host = settings.get("host") or "127.0.0.1"
-    local_port = settings.get("port") or 3306
-
-    # If something is already listening on the configured local endpoint,
-    # assume an existing tunnel is active and reusable.
-    if _is_tcp_port_open(local_host, local_port):
-        return None
-
-    ssh_target = f"{settings['ssh_user']}@{settings['ssh_host']}"
-    bind_spec = (
-        f"{local_host}:{local_port}:"
-        f"{settings['mysql_remote_host']}:{settings['mysql_remote_port']}"
-    )
-    
-    # Try to use sshpass if available (for automated password auth)
-    sshpass_available = shutil.which("sshpass") is not None
-    
-    if sshpass_available:
-        # Use sshpass with a runtime password prompt.
-        ssh_password = get_ssh_password(settings)
-        
-        command = [
-            "sshpass",
-            "-p",
-            ssh_password,
-            "ssh",
-            "-N",
-            "-L",
-            bind_spec,
-            "-p",
-            str(settings["ssh_port"]),
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "UserKnownHostsFile=/dev/null",
-            ssh_target,
-        ]
-    else:
-        # Fallback: provide manual instructions
-        manual_cmd = (
-            f"ssh -N -L {bind_spec} -p {settings['ssh_port']} {ssh_target}"
-        )
-        raise RuntimeError(
-            "SSH tunnel requires sshpass for automated password authentication.\n\n"
-            "Install sshpass:\n"
-            "  brew install sshpass\n\n"
-            "Or set up manually in another terminal:\n"
-            f"  {manual_cmd}\n"
-            "Then re-run this script."
-        )
-
-    # Start tunnel process
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as error:
-        raise RuntimeError(
-            f"Failed to start SSH tunnel with sshpass: {error}"
-        )
-
-    # Wait for tunnel to become ready (up to 90 seconds)
-    max_wait_iterations = 180
-    for iteration in range(max_wait_iterations):
-        # Check if process exited early (indicates failure)
-        if process.poll() is not None:
-            exit_code = process.returncode
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"SSH tunnel exited with code {exit_code}.\n"
-                    "Possible causes:\n"
-                    "  - Wrong SSH password in config\n"
-                    "  - Remote host unreachable\n"
-                    "  - SSH key authorization issue\n\n"
-                    "Verify credentials and connectivity, then retry."
-                )
-            break
-        
-        # Check if port is now open
-        if _is_tcp_port_open(local_host, local_port, timeout=0.5):
-            return process
-        
-        time.sleep(0.5)
-
-    # Timeout reached
-    process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-    
-    raise RuntimeError(
-        f"SSH tunnel did not open local port {local_port} within {max_wait_iterations * 0.5:.0f}s.\n"
-        "The SSH process may have encountered an authentication issue.\n"
-        "Verify SSH password and connectivity, then retry."
-    )
-
-
-def _stop_ssh_tunnel(process):
-    if process is None:
-        return
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process.kill()
 
 
 def get_mysql_connection_candidates():
@@ -647,7 +445,7 @@ def connect_to_remote_mysql_db():
 
         connection = None
         try:
-            tunnel_process = _start_ssh_tunnel(settings)
+            tunnel_process = _start_ssh_tunnel(settings, get_password_func=get_ssh_password)
             db_name = settings["database"]
             connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
             
@@ -815,7 +613,7 @@ def preflight_mysql_connection_check():
 
         connection = None
         try:
-            tunnel_process = _start_ssh_tunnel(settings)
+            tunnel_process = _start_ssh_tunnel(settings, get_password_func=get_ssh_password)
             query_timeout = get_config("DB_SERVER", "QUERY_TIMEOUT", 5)
             connection = pymysql.connect(
                 host=settings["host"],
@@ -886,24 +684,8 @@ def open_response_in_integrated_browser(response_text, output_file):
     return open_file_in_integrated_browser(output_file)
 
 
-def extract_insert_statements(response_text):
-    normalized = response_text.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-    plain_text = html.unescape(re.sub(r"<[^>]+>", "\n", normalized))
-    statements = re.findall(r"(?is)\binsert\b.*?;", plain_text)
-    cleaned = [re.sub(r"\s+", " ", stmt).strip() for stmt in statements]
-    return cleaned
 
 
-def save_insert_statements(response_text, csv_output_path, data_dir):
-    sql_output = data_dir / f"{Path(csv_output_path).stem}.sql"
-    statements = extract_insert_statements(response_text)
-
-    if statements:
-        sql_output.write_text("\n".join(statements) + "\n", encoding="utf-8")
-    else:
-        sql_output.write_text("-- No INSERT statements found in upload response.\n", encoding="utf-8")
-
-    return sql_output
 
 
 def pick_file(root):
