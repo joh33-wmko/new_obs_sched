@@ -6,7 +6,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import datetime
 import importlib
-import ast
 import html
 import re
 import shutil
@@ -33,32 +32,11 @@ from common.obs_sem_utils import (
     _normalize_semester_token,
     _normalize_staff_type,
     build_output_filename,
+    ensure_data_dir,
+    copy_source_to_data_dir,
+    store_last_csv_filename,
+    load_live_config,
 )
-
-def load_live_config(config_path=None):
-    config_file = Path(config_path) if config_path else PROJECT_ROOT / "common" / "config.live.ini"
-    if not config_file.exists():
-        return {}
-
-    content = config_file.read_text(encoding="utf-8").strip()
-    if not content:
-        return {}
-
-    try:
-        parsed = ast.literal_eval(content)
-    except (SyntaxError, ValueError):
-        parsed = None
-
-    if isinstance(parsed, dict):
-        return parsed
-
-    namespace = {}
-    try:
-        exec(compile(content, str(config_file), "exec"), {"__builtins__": {}}, namespace)
-    except Exception:
-        return {}
-
-    return {k: v for k, v in namespace.items() if not k.startswith("_")}
 
 
 LIVE_CONFIG = load_live_config()
@@ -398,12 +376,6 @@ def _flatten_headers(columns):
     return flattened
 
 
-def ensure_data_dir():
-    data_dir = PROJECT_ROOT / "data"
-    data_dir.mkdir(exist_ok=True)
-    return data_dir
-
-
 def write_db_report(report_text, report_type, data_dir):
     """Append a database report to Step11_db_report.txt with type and timestamp."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -452,22 +424,6 @@ def fetch_db_snapshot(cursor, main_table, type_columns, staff_types):
             type_counts[staff_type] = cursor.fetchone()[0]
 
     return total_rows, type_counts
-
-
-def copy_source_to_data_dir(file_path, data_dir):
-    source = Path(file_path)
-    destination = data_dir / source.name
-
-    if source.resolve() != destination.resolve():
-        shutil.copy2(source, destination)
-
-    return destination
-
-
-def store_last_csv_filename(output_path, data_dir):
-    """Record the last generated CSV filename for reference."""
-    tracker_file = data_dir / "last_generated_csv_filename.txt"
-    tracker_file.write_text(f"{output_path.name}\n", encoding="utf-8")
 
 
 def infer_upload_type(xlsx_file_path=None, csv_file_path=None):

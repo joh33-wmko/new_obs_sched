@@ -4,9 +4,14 @@ This module is intentionally lightweight as a shared place for semester/date
 helper functions used across scripts.
 """
 
+import ast
 import datetime
 import re
+import shutil
 from pathlib import Path
+
+# Project root: parent of common/ directory
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def semester_token_from_date(value):
@@ -145,3 +150,84 @@ def update_config_sems(config_path=None, year=None):
         "semester_a": {"start_date": sem_a_start, "end_date": sem_a_end},
         "semester_b": {"start_date": sem_b_start, "end_date": sem_b_end},
     }
+
+
+def load_live_config(config_path=None):
+    """Load and parse the live configuration file.
+    
+    Designed for independent multi-step use: accepts optional config_path,
+    returns dict (no module-global state), allowing different steps to call
+    this function independently with their own config file paths.
+    
+    Args:
+        config_path: Optional path to config file. Defaults to PROJECT_ROOT/common/config.live.ini.
+    
+    Returns:
+        dict: Parsed configuration or empty dict if file not found/invalid.
+    """
+    config_file = Path(config_path) if config_path else PROJECT_ROOT / "common" / "config.live.ini"
+    if not config_file.exists():
+        return {}
+
+    content = config_file.read_text(encoding="utf-8").strip()
+    if not content:
+        return {}
+
+    try:
+        parsed = ast.literal_eval(content)
+    except (SyntaxError, ValueError):
+        parsed = None
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    namespace = {}
+    try:
+        exec(compile(content, str(config_file), "exec"), {"__builtins__": {}}, namespace)
+    except Exception:
+        return {}
+
+    return {k: v for k, v in namespace.items() if not k.startswith("_")}
+
+
+def ensure_data_dir():
+    """Create and return the data directory at PROJECT_ROOT/data.
+    
+    Returns:
+        Path: Path to the data directory.
+    """
+    data_dir = PROJECT_ROOT / "data"
+    data_dir.mkdir(exist_ok=True)
+    return data_dir
+
+
+def copy_source_to_data_dir(file_path, data_dir):
+    """Copy a source file to the data directory if not already there.
+    
+    Args:
+        file_path: Path to source file.
+        data_dir: Path to destination data directory.
+    
+    Returns:
+        Path: Path to the copied file in data_dir.
+    """
+    source = Path(file_path)
+    destination = data_dir / source.name
+
+    if source.resolve() != destination.resolve():
+        shutil.copy2(source, destination)
+
+    return destination
+
+
+def store_last_csv_filename(output_path, data_dir):
+    """Record the last generated CSV filename for reference.
+    
+    Writes filename to last_generated_csv_filename.txt for tracking.
+    
+    Args:
+        output_path: Path to the output CSV file.
+        data_dir: Path to data directory where tracker file is stored.
+    """
+    tracker_file = data_dir / "last_generated_csv_filename.txt"
+    tracker_file.write_text(f"{output_path.name}\n", encoding="utf-8")
