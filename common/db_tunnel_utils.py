@@ -360,12 +360,22 @@ def run_mysql_preflight(candidates, pymysql_module, *, query_timeout=5, password
     )
 
 
-def apply_insert_statements_to_database(connection, sql_file):
+def apply_insert_statements_to_database(
+    connection,
+    sql_file,
+    commit_interval=200,
+    use_insert_ignore=True,
+    detail_limit=300,
+):
     """Execute INSERT statements from SQL file and track results.
     
     Args:
         connection: Active database connection.
         sql_file: Path to SQL file containing INSERT statements.
+        commit_interval: Commit every N processed statements for better performance.
+        use_insert_ignore: Rewrite INSERT INTO -> INSERT IGNORE INTO to avoid
+            expensive duplicate-key exceptions.
+        detail_limit: Maximum per-statement rows saved to stats['statements'].
     
     Returns:
         dict: Statistics including total, success, failed, already_exists counts,
@@ -376,7 +386,8 @@ def apply_insert_statements_to_database(connection, sql_file):
         'success': 0,
         'failed': 0,
         'already_exists': 0,
-        'statements': []  # List of (statement, status, error) tuples
+        'statements': [],  # List of (statement, status, error) tuples
+        'details_omitted': 0,
     }
     
     sql_text = sql_file.read_text(encoding="utf-8")
@@ -386,18 +397,43 @@ def apply_insert_statements_to_database(connection, sql_file):
         stats['total'] = 0
         return stats
     
+    try:
+        commit_interval = max(1, int(commit_interval))
+    except (TypeError, ValueError):
+        commit_interval = 200
+
+    try:
+        detail_limit = int(detail_limit)
+    except (TypeError, ValueError):
+        detail_limit = 300
+    detail_limit = max(0, detail_limit)
+
     cursor = connection.cursor()
+    processed_since_commit = 0
     try:
         for stmt in statements:
             stats['total'] += 1
+            processed_since_commit += 1
             status = None
             error_msg = None
+
+            exec_stmt = stmt
+            if use_insert_ignore and re.match(r"(?is)^\s*insert\s+into\b", stmt):
+                exec_stmt = re.sub(
+                    r"(?is)^\s*insert\s+into\b",
+                    "INSERT IGNORE INTO",
+                    stmt,
+                    count=1,
+                )
             
             try:
-                cursor.execute(stmt)
-                connection.commit()
-                stats['success'] += 1
-                status = 'SUCCESS'
+                cursor.execute(exec_stmt)
+                if use_insert_ignore and re.match(r"(?is)^\s*insert\s+into\b", stmt) and cursor.rowcount == 0:
+                    stats['already_exists'] += 1
+                    status = 'DUPLICATE'
+                else:
+                    stats['success'] += 1
+                    status = 'SUCCESS'
             except Exception as e:
                 error_msg = str(e)
                 # Check if it's a duplicate key error (already exists)
@@ -407,8 +443,18 @@ def apply_insert_statements_to_database(connection, sql_file):
                 else:
                     stats['failed'] += 1
                     status = 'FAILED'
+
+            if processed_since_commit >= commit_interval:
+                connection.commit()
+                processed_since_commit = 0
             
-            stats['statements'].append((stmt, status, error_msg))
+            if len(stats['statements']) < detail_limit:
+                stats['statements'].append((stmt, status, error_msg))
+            else:
+                stats['details_omitted'] += 1
+
+        if processed_since_commit > 0:
+            connection.commit()
     finally:
         cursor.close()
     
@@ -449,6 +495,11 @@ def write_insert_results_to_file(stats, sql_file, data_dir):
             if error:
                 f.write(f"  ERROR: {error[:150]}{'...' if len(error) > 150 else ''}\n")
             f.write("\n")
+
+        omitted = stats.get('details_omitted', 0)
+        if omitted:
+            f.write("...\n")
+            f.write(f"Omitted {omitted} additional statement details for performance.\n")
     
     return result_file
 

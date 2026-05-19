@@ -173,8 +173,13 @@ def load_live_config(config_path=None):
     if not content:
         return {}
 
+    # Be tolerant of JSON-style literals in otherwise Python-like config files.
+    normalized_content = re.sub(r"\btrue\b", "True", content)
+    normalized_content = re.sub(r"\bfalse\b", "False", normalized_content)
+    normalized_content = re.sub(r"\bnull\b", "None", normalized_content)
+
     try:
-        parsed = ast.literal_eval(content)
+        parsed = ast.literal_eval(normalized_content)
     except (SyntaxError, ValueError):
         parsed = None
 
@@ -183,7 +188,7 @@ def load_live_config(config_path=None):
 
     namespace = {}
     try:
-        exec(compile(content, str(config_file), "exec"), {"__builtins__": {}}, namespace)
+        exec(compile(normalized_content, str(config_file), "exec"), {"__builtins__": {}}, namespace)
     except Exception:
         return {}
 

@@ -57,6 +57,22 @@ def get_config(section, key, default=None):
     return LIVE_CONFIG.get(section, {}).get(key, default)
 
 
+def _is_debug_enabled():
+    """Return True when debug logging is enabled via config."""
+    value = get_config("NEW_OBS_SEM", "DEBUG", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _debug_log(message):
+    """Emit debug message only when DEBUG is enabled."""
+    if _is_debug_enabled():
+        print(f"[DEBUG] {message}")
+
+
 def get_ssh_password(settings):
     """Get SSH password from cache or prompt user for it."""
     cache_key = (settings.get("ssh_host"), settings.get("ssh_user"), settings.get("ssh_port"))
@@ -454,6 +470,9 @@ def connect_to_remote_mysql_db():
         return False
 
     connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
+    insert_commit_interval = get_config("DB_SERVER", "INSERT_COMMIT_INTERVAL", 200)
+    insert_use_ignore = get_config("DB_SERVER", "INSERT_USE_IGNORE", True)
+    insert_detail_limit = get_config("DB_SERVER", "INSERT_DETAIL_LIMIT", 300)
     type_columns = get_config("DB_SERVER", "TYPE_COLUMNS", [])
     staff_types = get_config("DB_SERVER", "STAFF_TYPES", [])
     preferred_tables = get_config("DB_SERVER", "PREFERRED_TABLES", [])
@@ -523,14 +542,13 @@ def connect_to_remote_mysql_db():
 
     def _apply_operation(connection, settings):
         db_name = settings["database"]
-        pre_overview = collect_mysql_overview(
+        stats = apply_insert_statements_to_database(
             connection,
-            db_name,
-            preferred_tables,
-            type_columns,
-            staff_types,
+            sql_file,
+            commit_interval=insert_commit_interval,
+            use_insert_ignore=insert_use_ignore,
+            detail_limit=insert_detail_limit,
         )
-        stats = apply_insert_statements_to_database(connection, sql_file)
         post_overview = collect_mysql_overview(
             connection,
             db_name,
@@ -541,14 +559,13 @@ def connect_to_remote_mysql_db():
         result_file = write_insert_results_to_file(stats, sql_file, data_dir)
         return {
             "stats": stats,
-            "pre_overview": pre_overview,
             "post_overview": post_overview,
             "result_file": result_file,
             "main_table": post_overview["main_table"],
         }
 
     apply_result = run_with_mysql_connection(
-        candidates,
+        [settings],
         pymysql,
         _apply_operation,
         connect_timeout=connect_timeout,
@@ -953,6 +970,12 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
 
     if upload_enabled:
         upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
+        _debug_log(
+            "Upload URL check: "
+            f"value={repr(upload_url)}, "
+            f"new_obs_sem_type={type(LIVE_CONFIG.get('NEW_OBS_SEM')).__name__}, "
+            f"config_sections={list(LIVE_CONFIG.keys())}"
+        )
         if not upload_url:
             show_focused_info_dialog(
                 "Invalid upload URL",
@@ -989,6 +1012,12 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
 def load_swoc_members():
     """Load SWOC team members from config."""
     members = get_config("SWOC_ROTATION", "MEMBERS", [])
+    _debug_log(
+        "SWOC members load: "
+        f"type={type(members).__name__}, "
+        f"count={(len(members) if isinstance(members, list) else 0)}, "
+        f"config_sections={list(LIVE_CONFIG.keys())}"
+    )
     if not isinstance(members, list):
         return []
 
@@ -1446,14 +1475,14 @@ def main():
         root.destroy()
         return
 
-    data_dir = ensure_data_dir()
-    copied_file_path = copy_source_to_data_dir(file_path, data_dir)
-
     # Detect and confirm staff type
-    detected_staff_type = _normalize_staff_type(Path(copied_file_path).stem)
-    if not confirm_staff_type_dialog(detected_staff_type or "unknown", copied_file_path, parent=root):
+    detected_staff_type = _normalize_staff_type(Path(file_path).stem)
+    if not confirm_staff_type_dialog(detected_staff_type or "unknown", file_path, parent=root):
         root.destroy()
         return
+
+    data_dir = ensure_data_dir()
+    copied_file_path = copy_source_to_data_dir(file_path, data_dir)
 
     sheets = get_sheet_names(copied_file_path)
 
