@@ -1043,6 +1043,40 @@ def load_swoc_members():
             member["alias"] = member.get("initials")
             member.pop("initials", None)
         normalized.append(member)
+
+    return normalize_rotation_order(normalized)
+
+
+def _coerce_positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def normalize_rotation_order(members, preserve_list_order=False):
+    """Rewrite rotation_order to contiguous 1..N, optionally preserving list order."""
+    if preserve_list_order:
+        normalized = []
+        for position, member in enumerate(members, start=1):
+            member_copy = dict(member)
+            member_copy["rotation_order"] = position
+            normalized.append(member_copy)
+        return normalized
+
+    sortable = []
+    for original_index, member in enumerate(members):
+        order_value = _coerce_positive_int(member.get("rotation_order"))
+        fallback_order = original_index + 1
+        sortable.append((order_value if order_value is not None else fallback_order, original_index, dict(member)))
+
+    sortable.sort(key=lambda row: (row[0], row[1]))
+
+    normalized = []
+    for position, (_, _, member) in enumerate(sortable, start=1):
+        member["rotation_order"] = position
+        normalized.append(member)
     return normalized
 
 
@@ -1089,6 +1123,32 @@ def save_swoc_members(members):
     return True
 
 
+def write_swoc_member_list_log(members, changed=True):
+    """Write SWOC member list to log file."""
+    data_dir = ensure_data_dir()
+    log_file = data_dir / "swoc_member_list.log"
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"[{timestamp}] SWOC Member List\n"
+
+    if changed:
+        log_lines = [header]
+        for i, member in enumerate(members, start=1):
+            line = (
+                f"  #{i:02d} {member.get('name')} ({member.get('alias', '')})"
+            )
+            log_lines.append(line)
+        log_lines.append("\n")
+    else:
+        log_lines = [
+            header,
+            "  No change to swoc rotation member list or rotation order.\n",
+        ]
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write("\n".join(log_lines))
+
+
 def add_swoc_audit_log_entry(change_type, member_name, old_values, new_values, reason=""):
     """Write an entry to the SWOC rotation audit log."""
     data_dir = ensure_data_dir()
@@ -1121,7 +1181,7 @@ def show_member_edit_dialog(member_name, member_data, parent=None):
     owner = parent or getattr(tk, "_default_root", None)
     dialog = tk.Toplevel(owner)
     dialog.title(f"Edit Member: {member_name}")
-    _set_dialog_geometry(dialog, 500, 420, min_width=420, min_height=360)
+    _set_dialog_geometry(dialog, 520, 450, min_width=440, min_height=380)
     dialog.resizable(False, False)
     
     result = {"updated": False, "data": None}
@@ -1149,6 +1209,13 @@ def show_member_edit_dialog(member_name, member_data, parent=None):
             check = tk.Checkbutton(main_frame, variable=var, command=command)
         check.grid(row=row, column=1, sticky="w", pady=4, padx=(8, 0))
         return var
+
+    def create_text_field(label_text, initial_value, row):
+        tk.Label(main_frame, text=label_text + ":").grid(row=row, column=0, sticky="w", pady=4)
+        entry = tk.Entry(main_frame, width=18)
+        entry.insert(0, "" if initial_value is None else str(initial_value))
+        entry.grid(row=row, column=1, sticky="ew", pady=4, padx=(8, 0))
+        return entry
     
     # Create fields
     fields["service_start_date"] = create_date_field(
@@ -1159,13 +1226,17 @@ def show_member_edit_dialog(member_name, member_data, parent=None):
         "Service End Date (YYYY-MM-DD)", 
         member_data.get("service_end_date"), 1
     )
+    fields["rotation_order"] = create_text_field(
+        "Rotation Order #",
+        member_data.get("rotation_order"), 2
+    )
     fields["rotation_start_date"] = create_date_field(
         "Rotation Start Date (YYYY-MM-DD)", 
-        member_data.get("rotation_start_date"), 3
+        member_data.get("rotation_start_date"), 4
     )
     fields["rotation_end_date"] = create_date_field(
         "Rotation End Date (YYYY-MM-DD)", 
-        member_data.get("rotation_end_date"), 4
+        member_data.get("rotation_end_date"), 5
     )
 
     initial_active = bool(member_data.get("active", True))
@@ -1188,30 +1259,39 @@ def show_member_edit_dialog(member_name, member_data, parent=None):
     fields["active"] = create_bool_field(
         "Active in Rotation",
         initial_active,
-        2,
+        3,
         command=on_active_toggle,
     )
     
     # Instructions
     instr = tk.Label(
         main_frame,
-        text="Leave blank for null dates. Dates are YYYY-MM-DD format.",
+        text="Rotation order must be a positive integer. Dates are YYYY-MM-DD format.",
         font=("Arial", 9),
         fg="gray"
     )
-    instr.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+    instr.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
     
     # Buttons
     button_frame = tk.Frame(main_frame)
-    button_frame.grid(row=6, column=0, columnspan=2, pady=(12, 0))
+    button_frame.grid(row=7, column=0, columnspan=2, pady=(12, 0))
     
     def save_changes():
         original_service_end = member_data.get("service_end_date") or ""
         new_service_end = (fields["service_end_date"].get() or "").strip()
+        rotation_order = _coerce_positive_int((fields["rotation_order"].get() or "").strip())
+        if rotation_order is None:
+            show_focused_info_dialog(
+                "Invalid rotation order",
+                "Rotation Order # must be a positive integer.",
+                dialog,
+            )
+            return
 
         updated = {
             "name": member_data["name"],
             "alias": member_data.get("alias") or member_data.get("initials"),
+            "rotation_order": rotation_order,
             "service_start_date": fields["service_start_date"].get() or None,
             "service_end_date": new_service_end or None,
             "active": fields["active"].get(),
@@ -1260,6 +1340,29 @@ def show_member_management_dialog(parent=None):
     
     members = load_swoc_members()
     
+    # Capture initial state for change detection
+    def get_member_list_state(member_list):
+        return [(m.get("name"), m.get("rotation_order")) for m in member_list]
+    
+    initial_state = get_member_list_state(members)
+    has_changes = [False]
+    close_button_holder = {}
+
+    def mark_changes():
+        """Check for net changes and update button label."""
+        current_state = get_member_list_state(members)
+        has_changes[0] = current_state != initial_state
+        if "widget" in close_button_holder and close_button_holder["widget"]:
+            button_text = "Save" if has_changes[0] else "Close"
+            close_button_holder["widget"].config(text=button_text)
+
+    def close_and_log():
+        """Close dialog and write to SWOC member list log."""
+        mark_changes()
+        write_swoc_member_list_log(members, changed=has_changes[0])
+        dialog.destroy()
+
+    
     # Create a frame with scrollbar
     main_frame = tk.Frame(dialog)
     main_frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1270,6 +1373,23 @@ def show_member_management_dialog(parent=None):
         text="Team Members",
         font=("Arial", 12, "bold")
     ).pack(anchor="w", pady=(0, 8))
+    tk.Label(
+        main_frame,
+        text=(
+            "Mouse: drag and drop to reorder.  Keyboard: arrows to select, "
+            "Space to pick/drop, arrows to move while picked."
+        ),
+        font=("Arial", 9),
+        fg="white",
+    ).pack(anchor="w", pady=(0, 6))
+
+    keyboard_status_var = tk.StringVar(value="Keyboard mode: use Up/Down to select a member.")
+    tk.Label(
+        main_frame,
+        textvariable=keyboard_status_var,
+        font=("Arial", 9),
+        fg="white",
+    ).pack(anchor="w", pady=(0, 6))
     
     # Listbox with members
     list_frame = tk.Frame(main_frame)
@@ -1282,18 +1402,221 @@ def show_member_management_dialog(parent=None):
     listbox.pack(side="left", fill="both", expand=True)
     scrollbar.config(command=listbox.yview)
     
-    # Populate listbox
-    for i, member in enumerate(members):
-        active_status = "✓" if member.get("active") else "✗"
-        display_text = f"{member['name']} ({member.get('alias', '')}) [{active_status}]"
-        listbox.insert(i, display_text)
-    
-    def refresh_listbox():
+    def refresh_listbox(selected_index=None):
         listbox.delete(0, "end")
         for i, member in enumerate(members):
             active_status = "✓" if member.get("active") else "✗"
-            display_text = f"{member['name']} ({member.get('alias', '')}) [{active_status}]"
+            display_text = (
+                f"#{i + 1:02d} "
+                f"{member['name']} ({member.get('alias', '')}) [{active_status}]"
+            )
             listbox.insert(i, display_text)
+        if selected_index is not None and members:
+            bounded_index = max(0, min(selected_index, len(members) - 1))
+            listbox.selection_set(bounded_index)
+            listbox.activate(bounded_index)
+
+    refresh_listbox()
+    if members:
+        listbox.selection_set(0)
+        listbox.activate(0)
+
+    drag_start_index = [None]
+    drag_current_index = [None]
+    drag_start_order = [[]]
+    drag_moved_name = [None]
+    keyboard_reorder_active = [False]
+    keyboard_start_order = [[]]
+    keyboard_moved_name = [None]
+    keyboard_pick_order = [[]]
+    keyboard_pick_index = [0]
+
+    def selected_index():
+        selection = listbox.curselection()
+        if not selection:
+            if members:
+                listbox.selection_set(0)
+                listbox.activate(0)
+                return 0
+            return None
+        return selection[0]
+
+    def set_selected_index(index):
+        if not members:
+            return
+        bounded_index = max(0, min(index, len(members) - 1))
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(bounded_index)
+        listbox.activate(bounded_index)
+        listbox.see(bounded_index)
+
+    def update_keyboard_status_for_selection(index):
+        if index is None or not members:
+            keyboard_status_var.set("Keyboard mode: no members available.")
+            return
+        member = members[index]
+        if keyboard_reorder_active[0]:
+            keyboard_status_var.set(
+                f"Moving {member.get('name')}: use Up/Down to reposition, Space to drop."
+            )
+        else:
+            keyboard_status_var.set(
+                f"Selected #{index + 1:02d} {member.get('name')}. Press Space to pick up this member."
+            )
+
+    def commit_keyboard_reorder():
+        members[:] = normalize_rotation_order(members, preserve_list_order=True)
+        save_swoc_members(members)
+        add_swoc_audit_log_entry(
+            "MEMBER_REORDERED",
+            keyboard_moved_name[0] or "UNKNOWN",
+            str(keyboard_start_order[0] or []),
+            str([m.get("name") for m in members]),
+            "via keyboard reorder in member management interface",
+        )
+        mark_changes()
+
+    def handle_up_down(delta):
+        if not members:
+            return "break"
+
+        current = selected_index()
+        if current is None:
+            return "break"
+
+        target = max(0, min(current + delta, len(members) - 1))
+        if target == current:
+            update_keyboard_status_for_selection(current)
+            return "break"
+
+        if keyboard_reorder_active[0]:
+            moving_member = members.pop(current)
+            members.insert(target, moving_member)
+            refresh_listbox(selected_index=target)
+            update_keyboard_status_for_selection(target)
+        else:
+            set_selected_index(target)
+            update_keyboard_status_for_selection(target)
+
+        return "break"
+
+    def handle_space(_event):
+        if not members:
+            return "break"
+
+        current = selected_index()
+        if current is None:
+            return "break"
+
+        if not keyboard_reorder_active[0]:
+            keyboard_reorder_active[0] = True
+            keyboard_pick_order[0] = [dict(m) for m in members]
+            keyboard_pick_index[0] = current
+            keyboard_start_order[0] = [m.get("name") for m in members]
+            keyboard_moved_name[0] = members[current].get("name")
+            keyboard_status_var.set(
+                f"Picked {members[current].get('name')}. Use Up/Down to move, Space to drop. Press ESC to cancel."
+            )
+            return "break"
+
+        keyboard_reorder_active[0] = False
+        commit_keyboard_reorder()
+        refresh_listbox(selected_index=current)
+        keyboard_status_var.set(
+            f"Placed {keyboard_moved_name[0] or 'member'} at position #{current + 1:02d}."
+        )
+        keyboard_start_order[0] = []
+        keyboard_moved_name[0] = None
+        keyboard_pick_order[0] = []
+        keyboard_pick_index[0] = 0
+        return "break"
+
+    def handle_escape(_event):
+        if not keyboard_reorder_active[0]:
+            return "break"
+
+        if keyboard_pick_order[0]:
+            members[:] = keyboard_pick_order[0]
+            pick_index = keyboard_pick_index[0] or 0
+            refresh_listbox(selected_index=pick_index)
+            update_keyboard_status_for_selection(pick_index)
+
+        keyboard_reorder_active[0] = False
+        keyboard_pick_order[0] = []
+        keyboard_pick_index[0] = 0
+        keyboard_start_order[0] = []
+        keyboard_moved_name[0] = None
+        keyboard_status_var.set("Cancelled. Use Up/Down to select a member.")
+        return "break"
+
+    def begin_drag(event):
+        keyboard_reorder_active[0] = False
+        if not members:
+            return
+        index = listbox.nearest(event.y)
+        if index < 0 or index >= len(members):
+            return
+        drag_start_index[0] = index
+        drag_current_index[0] = index
+        drag_start_order[0] = [m.get("name") for m in members]
+        drag_moved_name[0] = members[index].get("name")
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(index)
+        update_keyboard_status_for_selection(index)
+
+    def drag_member(event):
+        start_index = drag_start_index[0]
+        if start_index is None:
+            return
+        target_index = listbox.nearest(event.y)
+        if target_index < 0 or target_index >= len(members):
+            return
+        current_index = drag_current_index[0]
+        if current_index is None:
+            return
+        if target_index == current_index:
+            return
+
+        moving_member = members.pop(current_index)
+        members.insert(target_index, moving_member)
+        drag_current_index[0] = target_index
+        refresh_listbox(selected_index=target_index)
+        update_keyboard_status_for_selection(target_index)
+
+    def end_drag(_event):
+        start_index = drag_start_index[0]
+        end_index = drag_current_index[0]
+        if start_index is None or end_index is None:
+            return
+
+        if end_index != start_index:
+            members[:] = normalize_rotation_order(members, preserve_list_order=True)
+            save_swoc_members(members)
+            add_swoc_audit_log_entry(
+                "MEMBER_REORDERED",
+                drag_moved_name[0] or "UNKNOWN",
+                str(drag_start_order[0] or []),
+                str([m.get("name") for m in members]),
+                "via drag-and-drop in member management interface",
+            )
+            refresh_listbox(selected_index=end_index)
+            update_keyboard_status_for_selection(end_index)
+            mark_changes()
+
+        drag_start_index[0] = None
+        drag_current_index[0] = None
+        drag_start_order[0] = []
+        drag_moved_name[0] = None
+
+    listbox.bind("<ButtonPress-1>", begin_drag)
+    listbox.bind("<B1-Motion>", drag_member)
+    listbox.bind("<ButtonRelease-1>", end_drag)
+    listbox.bind("<Up>", lambda _event: handle_up_down(-1))
+    listbox.bind("<Down>", lambda _event: handle_up_down(1))
+    listbox.bind("<space>", handle_space)
+    listbox.bind("<Escape>", handle_escape)
+    update_keyboard_status_for_selection(selected_index())
+    listbox.focus_set()
 
     # Buttons
     button_frame = tk.Frame(main_frame)
@@ -1303,6 +1626,7 @@ def show_member_management_dialog(parent=None):
         blank = {
             "name": "",
             "alias": "",
+            "rotation_order": len(members) + 1,
             "service_start_date": datetime.date.today().isoformat(),
             "service_end_date": None,
             "active": True,
@@ -1360,7 +1684,10 @@ def show_member_management_dialog(parent=None):
 
         updated = show_member_edit_dialog(blank["name"], blank, dialog)
         if updated:
+            # New members are always appended to the end of the current rotation.
+            updated["rotation_order"] = len(members) + 1
             members.append(updated)
+            members[:] = normalize_rotation_order(members, preserve_list_order=True)
             save_swoc_members(members)
             add_swoc_audit_log_entry(
                 "MEMBER_ADDED",
@@ -1370,6 +1697,7 @@ def show_member_management_dialog(parent=None):
                 "via member management interface",
             )
             refresh_listbox()
+            mark_changes()
             show_focused_info_dialog("Success", f"{updated['name']} added and logged to audit trail.", dialog)
 
     def edit_member():
@@ -1388,8 +1716,16 @@ def show_member_management_dialog(parent=None):
         )
         
         if updated:
-            old_member = members[idx]
+            old_member = dict(members[idx])
             members[idx] = updated
+            requested_order = _coerce_positive_int(updated.get("rotation_order")) or (idx + 1)
+            requested_order = max(1, min(requested_order, len(members)))
+
+            if requested_order != idx + 1:
+                moved_member = members.pop(idx)
+                members.insert(requested_order - 1, moved_member)
+
+            members[:] = normalize_rotation_order(members, preserve_list_order=True)
             save_swoc_members(members)
             add_swoc_audit_log_entry(
                 "MEMBER_UPDATED",
@@ -1399,13 +1735,52 @@ def show_member_management_dialog(parent=None):
                 "via member management interface",
             )
             refresh_listbox()
+            mark_changes()
             show_focused_info_dialog("Success", "Member updated and logged to audit trail.", dialog)
+
+    def remove_member():
+        selection = listbox.curselection()
+        if not selection:
+            show_focused_info_dialog("No Selection", "Please select a member to remove.", dialog)
+            return
+
+        idx = selection[0]
+        member_to_remove = members[idx]
+        if not show_focused_yes_no_dialog(
+            "Remove Member",
+            (
+                f"Remove {member_to_remove['name']} from rotation?\n\n"
+                "This will re-number all following members."
+            ),
+            parent=dialog,
+        ):
+            return
+
+        removed_member = members.pop(idx)
+        members[:] = normalize_rotation_order(members, preserve_list_order=True)
+        save_swoc_members(members)
+        add_swoc_audit_log_entry(
+            "MEMBER_REMOVED",
+            removed_member["name"],
+            str(removed_member),
+            None,
+            "via member management interface",
+        )
+        refresh_listbox()
+        mark_changes()
+        show_focused_info_dialog(
+            "Success",
+            f"{removed_member['name']} removed; rotation order was re-numbered.",
+            dialog,
+        )
 
     tk.Button(button_frame, text="Add New", command=add_new_member).pack(side="left", padx=4)
     tk.Button(button_frame, text="Edit Selected", command=edit_member).pack(side="left", padx=4)
-    tk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right", padx=4)
+    tk.Button(button_frame, text="Remove Selected", command=remove_member).pack(side="left", padx=4)
+    close_button_holder["widget"] = tk.Button(button_frame, text="Close", command=close_and_log)
+    close_button_holder["widget"].pack(side="right", padx=4)
     
-    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.protocol("WM_DELETE_WINDOW", close_and_log)
     dialog.lift()
     dialog.focus_force()
     dialog.attributes("-topmost", True)
