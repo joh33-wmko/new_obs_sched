@@ -715,9 +715,16 @@ def pick_file(root):
             pass
 
 def get_sheet_names(file_path):
+    start_time = time.perf_counter()
     workbook = load_workbook(file_path, read_only=True, data_only=True)
     try:
-        return list(workbook.sheetnames)
+        sheet_names = list(workbook.sheetnames)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        _debug_log(
+            f"Sheet name discovery took {elapsed_ms:.1f} ms for {Path(file_path).name} "
+            f"({len(sheet_names)} sheets)"
+        )
+        return sheet_names
     finally:
         workbook.close()
 
