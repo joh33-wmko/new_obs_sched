@@ -1148,6 +1148,8 @@ def write_swoc_member_list_log(members, changed=True):
     with open(log_file, "a", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
+    return log_file
+
 
 def add_swoc_audit_log_entry(change_type, member_name, old_values, new_values, reason=""):
     """Write an entry to the SWOC rotation audit log."""
@@ -1357,9 +1359,37 @@ def show_member_management_dialog(parent=None):
             close_button_holder["widget"].config(text=button_text)
 
     def close_and_log():
-        """Close dialog and write to SWOC member list log."""
+        """Close dialog and notify user about log path behavior."""
         mark_changes()
-        write_swoc_member_list_log(members, changed=has_changes[0])
+        data_dir = ensure_data_dir()
+        log_file = data_dir / "swoc_member_list.log"
+
+        if has_changes[0]:
+            log_file = write_swoc_member_list_log(members, changed=True)
+            if sys.platform == "darwin":
+                try:
+                    subprocess.Popen(["open", "-R", str(log_file)])
+                except Exception:
+                    pass
+            show_focused_info_dialog(
+                "SWOC Member Log Saved",
+                (
+                    "SWOC member list log was updated.\n\n"
+                    f"Log file: {log_file.name}\n"
+                    f"Path: {log_file}"
+                ),
+                dialog,
+            )
+        else:
+            show_focused_info_dialog(
+                "No Changes",
+                (
+                    "Button was labeled Close.\n"
+                    "Filename path was not changed."
+                ),
+                dialog,
+            )
+
         dialog.destroy()
 
     
