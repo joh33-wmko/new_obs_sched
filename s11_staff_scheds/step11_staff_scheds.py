@@ -9,7 +9,6 @@ import importlib
 import html
 import re
 import shutil
-import socket
 import ssl
 import subprocess
 import sys
@@ -38,10 +37,10 @@ from common.obs_sem_utils import (
     load_live_config,
 )
 from common.db_tunnel_utils import (
-    _is_tcp_port_open,
-    _start_ssh_tunnel,
-    _stop_ssh_tunnel,
-    fetch_db_snapshot,
+    collect_mysql_overview,
+    format_type_summary,
+    run_with_mysql_connection,
+    run_mysql_preflight,
     apply_insert_statements_to_database,
     write_insert_results_to_file,
     extract_insert_statements,
@@ -454,153 +453,143 @@ def connect_to_remote_mysql_db():
         )
         return False
 
-    failures = []
-    for settings in candidates:
-        tunnel_process = None
-        missing = [name for name in ("host", "user", "password") if not settings.get(name)]
-        if missing:
-            failures.append(
-                f"[{settings.get('section')}] missing required keys: {', '.join(missing)}"
-            )
-            continue
+    connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
+    type_columns = get_config("DB_SERVER", "TYPE_COLUMNS", [])
+    staff_types = get_config("DB_SERVER", "STAFF_TYPES", [])
+    preferred_tables = get_config("DB_SERVER", "PREFERRED_TABLES", [])
 
-        connection = None
-        try:
-            tunnel_process = _start_ssh_tunnel(settings, password_provider=get_ssh_password)
-            db_name = settings["database"]
-            connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
-            
-            connection = pymysql.connect(
-                host=settings["host"],
-                user=settings["user"],
-                password=settings["password"],
-                database=db_name,
-                port=settings["port"],
-                connect_timeout=connect_timeout,
-            )
-            type_columns = get_config("DB_SERVER", "TYPE_COLUMNS", [])
-            staff_types = get_config("DB_SERVER", "STAFF_TYPES", [])
-            with connection.cursor() as cursor:
-                cursor.execute("SHOW TABLES;")
-                tables = [row[0] for row in cursor.fetchall()]
-                
-                # Find main table from preferred list
-                preferred = get_config("DB_SERVER", "PREFERRED_TABLES", [])
-                main_table = next((t for t in tables if t.lower() in [p.lower() for p in preferred]), None)
-                if not main_table and tables:
-                    main_table = tables[0]
-                if not main_table:
-                    show_focused_info_dialog("No tables found", f"No tables found in {db_name} database.")
-                    return False
+    def _overview_operation(connection, settings):
+        db_name = settings["database"]
+        overview = collect_mysql_overview(
+            connection,
+            db_name,
+            preferred_tables,
+            type_columns,
+            staff_types,
+        )
+        overview["db_name"] = db_name
+        return overview
 
-                total_rows, type_counts = fetch_db_snapshot(
-                    cursor,
-                    main_table,
-                    type_columns,
-                    staff_types,
-                )
-
-                # Get MySQL version
-                cursor.execute("SELECT VERSION()")
-                version_row = cursor.fetchone()
-                mysql_version = version_row[0] if version_row else "unknown"
-
-            type_summary = (
-                "\n".join(f"{k.upper()}: {v}" for k, v in type_counts.items())
-                if type_counts
-                else "Type breakdown unavailable (no type-like column found)."
-            )
-
-            msg = (
-                f"Connected using {settings['section']} tunnel {settings['host']}:{settings['port']}\n"
-                f"MySQL Server version: {mysql_version}\n\n"
-                f"Database: {db_name}\nTable: {main_table}\n\n"
-                f"Total rows: {total_rows}\n"
-                + type_summary
-            )
-            show_focused_info_dialog("Current MySQL Table Stats", msg, parent=getattr(tk, "_default_root", None))
-            write_db_report(msg, "BEFORE_INSERT", ensure_data_dir())
-
-            # Show the generated INSERT statements from the last SQL file
-            show_insert_statements_preview()
-            
-            # Ask user if they want to apply the inserts
-            apply_choice = show_focused_yes_no_dialog(
-                "Apply INSERTs Info",
-                "Apply the INSERT statements to the database?\n\n"
-                "This will:\n"
-                "• Insert new records\n"
-                "• Skip records that already exist (duplicate dates)\n"
-                "• Report statistics"
-            )
-            
-            if apply_choice:
-                # Get the SQL file path
-                data_dir = ensure_data_dir()
-                tracker_file = data_dir / "last_generated_csv_filename.txt"
-                if tracker_file.exists():
-                    csv_stem = tracker_file.read_text(encoding="utf-8").strip().rsplit(".csv", 1)[0]
-                    sql_file = data_dir / f"{csv_stem}.sql"
-                    if sql_file.exists():
-                        # Apply the inserts
-                        stats = apply_insert_statements_to_database(connection, sql_file)
-                        processed_type = detect_processed_report_type(data_dir)
-
-                        with connection.cursor() as snapshot_cursor:
-                            post_total_rows, post_type_counts = fetch_db_snapshot(
-                                snapshot_cursor,
-                                main_table,
-                                type_columns,
-                                staff_types,
-                            )
-                        post_type_summary = (
-                            "\n".join(f"{k.upper()}: {v}" for k, v in post_type_counts.items())
-                            if post_type_counts
-                            else "Type breakdown unavailable (no type-like column found)."
-                        )
-                        end_delimiter = (
-                            "\n" + ("=" * 72) + "\n"
-                            + f"END OF PROCESSING FOR TYPE: {processed_type}\n"
-                            + ("=" * 72)
-                        )
-                        
-                        # Write results to file
-                        result_file = write_insert_results_to_file(stats, sql_file, data_dir)
-                        
-                        # Show results
-                        result_msg = (
-                            f"Database Insert Results for {processed_type}\n\n"
-                            f"Total statements: {stats['total']}\n"
-                            f"✓ Inserted successfully: {stats['success']}\n"
-                            f"⊘ Already existed (skipped): {stats['already_exists']}\n"
-                            f"✗ Failed: {stats['failed']}\n\n"
-                            f"After Insert Snapshot\n"
-                            f"Table: {main_table}\n\n"
-                            f"Total rows: {post_total_rows}\n"
-                            f"{post_type_summary}\n\n"
-                            f"Detailed results saved to:\n{result_file.name}\n"
-                            f"{end_delimiter}"
-                        )
-                        
-                        show_focused_info_dialog("Insert Results", result_msg)
-                        write_db_report(result_msg, "AFTER_INSERT", ensure_data_dir())
-            
-            return True
-        except Exception as error:
-            failures.append(
-                f"[{settings.get('section')}] {settings.get('user')}@{settings.get('host')}:{settings.get('port')} -> {error}"
-            )
-        finally:
-            if connection is not None:
-                connection.close()
-            _stop_ssh_tunnel(tunnel_process)
-
-    show_focused_info_dialog(
-        "Database connection failed",
-        "Could not connect to the remote MySQL database with any configured profile.\n\n"
-        + "\n".join(failures)
+    overview_result = run_with_mysql_connection(
+        candidates,
+        pymysql,
+        _overview_operation,
+        connect_timeout=connect_timeout,
+        password_provider=get_ssh_password,
     )
-    return False
+    if not overview_result["ok"]:
+        show_focused_info_dialog(
+            "Database connection failed",
+            "Could not connect to the remote MySQL database with any configured profile.\n\n"
+            + "\n".join(overview_result["failures"])
+        )
+        return False
+
+    settings = overview_result["settings"]
+    overview = overview_result["result"]
+    type_summary = format_type_summary(overview["type_counts"])
+    msg = (
+        f"Connected using {settings['section']} tunnel {settings['host']}:{settings['port']}\n"
+        f"MySQL Server version: {overview['mysql_version']}\n\n"
+        f"Database: {overview['db_name']}\nTable: {overview['main_table']}\n\n"
+        f"Total rows: {overview['total_rows']}\n"
+        + type_summary
+    )
+    show_focused_info_dialog("Current MySQL Table Stats", msg, parent=getattr(tk, "_default_root", None))
+    write_db_report(msg, "BEFORE_INSERT", ensure_data_dir())
+
+    # UI-only behavior stays in Step11 wrapper.
+    show_insert_statements_preview()
+    apply_choice = show_focused_yes_no_dialog(
+        "Apply INSERTs Info",
+        "Apply the INSERT statements to the database?\n\n"
+        "This will:\n"
+        "• Insert new records\n"
+        "• Skip records that already exist (duplicate dates)\n"
+        "• Report statistics"
+    )
+    if not apply_choice:
+        return True
+
+    data_dir = ensure_data_dir()
+    tracker_file = data_dir / "last_generated_csv_filename.txt"
+    if not tracker_file.exists():
+        return True
+
+    csv_stem = tracker_file.read_text(encoding="utf-8").strip().rsplit(".csv", 1)[0]
+    sql_file = data_dir / f"{csv_stem}.sql"
+    if not sql_file.exists():
+        return True
+
+    def _apply_operation(connection, settings):
+        db_name = settings["database"]
+        pre_overview = collect_mysql_overview(
+            connection,
+            db_name,
+            preferred_tables,
+            type_columns,
+            staff_types,
+        )
+        stats = apply_insert_statements_to_database(connection, sql_file)
+        post_overview = collect_mysql_overview(
+            connection,
+            db_name,
+            preferred_tables,
+            type_columns,
+            staff_types,
+        )
+        result_file = write_insert_results_to_file(stats, sql_file, data_dir)
+        return {
+            "stats": stats,
+            "pre_overview": pre_overview,
+            "post_overview": post_overview,
+            "result_file": result_file,
+            "main_table": post_overview["main_table"],
+        }
+
+    apply_result = run_with_mysql_connection(
+        candidates,
+        pymysql,
+        _apply_operation,
+        connect_timeout=connect_timeout,
+        password_provider=get_ssh_password,
+    )
+    if not apply_result["ok"]:
+        show_focused_info_dialog(
+            "Database connection failed",
+            "Could not connect to the remote MySQL database with any configured profile.\n\n"
+            + "\n".join(apply_result["failures"])
+        )
+        return False
+
+    apply_payload = apply_result["result"]
+    stats = apply_payload["stats"]
+    post_overview = apply_payload["post_overview"]
+    processed_type = detect_processed_report_type(data_dir)
+    post_type_summary = format_type_summary(post_overview["type_counts"])
+    end_delimiter = (
+        "\n" + ("=" * 72) + "\n"
+        + f"END OF PROCESSING FOR TYPE: {processed_type}\n"
+        + ("=" * 72)
+    )
+
+    result_msg = (
+        f"Database Insert Results for {processed_type}\n\n"
+        f"Total statements: {stats['total']}\n"
+        f"✓ Inserted successfully: {stats['success']}\n"
+        f"⊘ Already existed (skipped): {stats['already_exists']}\n"
+        f"✗ Failed: {stats['failed']}\n\n"
+        f"After Insert Snapshot\n"
+        f"Table: {apply_payload['main_table']}\n\n"
+        f"Total rows: {post_overview['total_rows']}\n"
+        f"{post_type_summary}\n\n"
+        f"Detailed results saved to:\n{apply_payload['result_file'].name}\n"
+        f"{end_delimiter}"
+    )
+
+    show_focused_info_dialog("Insert Results", result_msg)
+    write_db_report(result_msg, "AFTER_INSERT", ensure_data_dir())
+    return True
 
 
 def preflight_mysql_connection_check():
@@ -622,45 +611,21 @@ def preflight_mysql_connection_check():
         )
         return False
 
-    failures = []
-    for settings in candidates:
-        tunnel_process = None
-        missing = [name for name in ("host", "user", "password") if not settings.get(name)]
-        if missing:
-            failures.append(
-                f"[{settings.get('section')}] missing required keys: {', '.join(missing)}"
-            )
-            continue
-
-        connection = None
-        try:
-            tunnel_process = _start_ssh_tunnel(settings, password_provider=get_ssh_password)
-            query_timeout = get_config("DB_SERVER", "QUERY_TIMEOUT", 5)
-            connection = pymysql.connect(
-                host=settings["host"],
-                user=settings["user"],
-                password=settings["password"],
-                port=settings["port"],
-                connect_timeout=query_timeout,
-            )
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-            return True
-        except Exception as error:
-            failures.append(
-                f"[{settings.get('section')}] {settings.get('user')}@{settings.get('host')}:{settings.get('port')} -> {error}"
-            )
-        finally:
-            if connection is not None:
-                connection.close()
-            _stop_ssh_tunnel(tunnel_process)
+    query_timeout = get_config("DB_SERVER", "QUERY_TIMEOUT", 5)
+    result = run_mysql_preflight(
+        candidates,
+        pymysql,
+        query_timeout=query_timeout,
+        password_provider=get_ssh_password,
+    )
+    if result["ok"]:
+        return True
 
     show_focused_info_dialog(
         "Database preflight failed",
         "Database authentication failed before import.\n\n"
         "Fix credentials/grants, then rerun this step.\n\n"
-        + "\n".join(failures)
+        + "\n".join(result["failures"])
     )
     return False
 

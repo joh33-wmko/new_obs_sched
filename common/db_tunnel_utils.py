@@ -238,6 +238,128 @@ def fetch_db_snapshot(cursor, main_table, type_columns, staff_types):
     return total_rows, type_counts
 
 
+def _choose_main_table(tables, preferred_tables):
+    """Pick a main table using preferred names, falling back to the first table."""
+    preferred_lower = [str(name).lower() for name in (preferred_tables or [])]
+    main_table = next((t for t in tables if t.lower() in preferred_lower), None)
+    if not main_table and tables:
+        main_table = tables[0]
+    return main_table
+
+
+def format_type_summary(type_counts):
+    """Format per-type counts into a display-friendly multiline string."""
+    if not type_counts:
+        return "Type breakdown unavailable (no type-like column found)."
+    return "\n".join(f"{k.upper()}: {v}" for k, v in type_counts.items())
+
+
+def collect_mysql_overview(connection, db_name, preferred_tables, type_columns, staff_types):
+    """Collect MySQL table and row/type overview for a database connection.
+
+    Returns:
+        dict with keys: mysql_version, main_table, total_rows, type_counts.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SHOW TABLES;")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        main_table = _choose_main_table(tables, preferred_tables)
+        if not main_table:
+            raise RuntimeError(f"No tables found in {db_name} database.")
+
+        total_rows, type_counts = fetch_db_snapshot(
+            cursor,
+            main_table,
+            type_columns,
+            staff_types,
+        )
+
+        cursor.execute("SELECT VERSION()")
+        version_row = cursor.fetchone()
+        mysql_version = version_row[0] if version_row else "unknown"
+
+    return {
+        "mysql_version": mysql_version,
+        "main_table": main_table,
+        "total_rows": total_rows,
+        "type_counts": type_counts,
+    }
+
+
+def run_with_mysql_connection(
+    candidates,
+    pymysql_module,
+    operation,
+    *,
+    connect_timeout=10,
+    password_provider=None,
+):
+    """Run an operation inside a managed MySQL connection + SSH tunnel context.
+
+    Args:
+        candidates: Iterable of connection settings dictionaries.
+        pymysql_module: Imported pymysql module.
+        operation: Callable ``operation(connection, settings)`` returning result.
+        connect_timeout: Timeout passed to pymysql.connect.
+        password_provider: Optional callable used by SSH tunnel helper.
+
+    Returns:
+        dict: ``{"ok": bool, "result": any, "settings": dict, "failures": list[str]}``
+    """
+    failures = []
+    for settings in candidates:
+        tunnel_process = None
+        missing = [name for name in ("host", "user", "password") if not settings.get(name)]
+        if missing:
+            failures.append(
+                f"[{settings.get('section')}] missing required keys: {', '.join(missing)}"
+            )
+            continue
+
+        connection = None
+        try:
+            tunnel_process = _start_ssh_tunnel(settings, password_provider=password_provider)
+            connection = pymysql_module.connect(
+                host=settings["host"],
+                user=settings["user"],
+                password=settings["password"],
+                database=settings.get("database"),
+                port=settings["port"],
+                connect_timeout=connect_timeout,
+            )
+            result = operation(connection, settings)
+            return {"ok": True, "result": result, "settings": settings, "failures": failures}
+        except Exception as error:
+            failures.append(
+                f"[{settings.get('section')}] {settings.get('user')}@{settings.get('host')}:{settings.get('port')} -> {error}"
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+            _stop_ssh_tunnel(tunnel_process)
+
+    return {"ok": False, "result": None, "settings": None, "failures": failures}
+
+
+def run_mysql_preflight(candidates, pymysql_module, *, query_timeout=5, password_provider=None):
+    """Check database connectivity/authentication using shared non-UI pipeline."""
+
+    def _preflight_operation(connection, _settings):
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        return {"preflight": "ok"}
+
+    return run_with_mysql_connection(
+        candidates,
+        pymysql_module,
+        _preflight_operation,
+        connect_timeout=query_timeout,
+        password_provider=password_provider,
+    )
+
+
 def apply_insert_statements_to_database(connection, sql_file):
     """Execute INSERT statements from SQL file and track results.
     
