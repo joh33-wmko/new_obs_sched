@@ -10,9 +10,11 @@ These are independent of Tkinter and suitable for use by any step.
 """
 
 import html
+import os
 import re
 import socket
 import subprocess
+import shutil
 import time
 from pathlib import Path
 
@@ -26,13 +28,41 @@ def _is_tcp_port_open(host, port, timeout=1.0):
         return False
 
 
-def _start_ssh_tunnel(settings, get_password_func=None):
+def _resolve_ssh_password(settings, password_provider=None, password_env_var=None):
+    """Resolve SSH password from a provider callback or environment variable.
+
+    Args:
+        settings: SSH settings dictionary passed to the provider.
+        password_provider: Optional callable ``password_provider(settings) -> str``.
+        password_env_var: Optional env var name for password fallback.
+
+    Returns:
+        str | None: Resolved password if available, else None.
+    """
+    if password_provider:
+        password = password_provider(settings)
+        if password:
+            return password
+
+    env_name = password_env_var or "SSH_PASSWORD"
+    return os.getenv(env_name) or None
+
+
+def _start_ssh_tunnel(
+    settings,
+    password_provider=None,
+    *,
+    get_password_func=None,
+    password_env_var=None,
+):
     """Start an SSH tunnel to access remote MySQL.
     
     Args:
         settings: Dict with SSH connection settings (host, user, port, etc.)
-        get_password_func: Callable that returns SSH password when needed.
-                          If not provided, will attempt SSH key auth only.
+        password_provider: Callable that returns SSH password when needed.
+                   If not provided, env var fallback and/or SSH key auth is used.
+        get_password_func: Backward-compatible alias for password_provider.
+        password_env_var: Optional env var name used as password fallback.
     
     Returns:
         subprocess.Popen: The tunnel process, or None if already listening.
@@ -43,8 +73,16 @@ def _start_ssh_tunnel(settings, get_password_func=None):
     if not settings.get("ssh_tunnel_enabled"):
         return None
 
+    # Backward compatibility for prior call sites.
+    if password_provider is None and get_password_func is not None:
+        password_provider = get_password_func
+
     local_host = settings.get("host") or "127.0.0.1"
     local_port = settings.get("port") or 3306
+    ssh_connect_timeout = int(settings.get("ssh_connect_timeout", 10))
+    ssh_tunnel_wait_seconds = float(settings.get("ssh_tunnel_wait_seconds", 20.0))
+    poll_interval = float(settings.get("ssh_tunnel_poll_interval", 0.25))
+    password_prompt_limit = int(settings.get("ssh_password_prompt_limit", 1))
 
     # If something is already listening on the configured local endpoint,
     # assume an existing tunnel is active and reusable.
@@ -57,47 +95,49 @@ def _start_ssh_tunnel(settings, get_password_func=None):
         f"{settings['mysql_remote_host']}:{settings['mysql_remote_port']}"
     )
     
-    # Try to use sshpass if available (for automated password auth)
-    sshpass_available = any(
-        subprocess.run(["which", tool], capture_output=True).returncode == 0
-        for tool in ["sshpass"]
+    # Prefer sshpass + password when available; otherwise try key-based auth.
+    sshpass_available = shutil.which("sshpass") is not None
+    ssh_password = _resolve_ssh_password(
+        settings,
+        password_provider=password_provider,
+        password_env_var=password_env_var,
     )
-    
-    if sshpass_available and get_password_func:
-        # Use sshpass with password from provided function
-        ssh_password = get_password_func(settings)
-        
-        command = [
-            "sshpass",
-            "-p",
-            ssh_password,
-            "ssh",
-            "-N",
-            "-L",
-            bind_spec,
-            "-p",
-            str(settings["ssh_port"]),
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "UserKnownHostsFile=/dev/null",
-            ssh_target,
-        ]
+    ssh_key_file = settings.get("ssh_key_file")
+
+    base_ssh_command = [
+        "ssh",
+        "-N",
+        "-L",
+        bind_spec,
+        "-p",
+        str(settings["ssh_port"]),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        f"ConnectTimeout={ssh_connect_timeout}",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        f"NumberOfPasswordPrompts={password_prompt_limit}",
+    ]
+    if ssh_key_file:
+        base_ssh_command.extend(["-i", str(ssh_key_file)])
+
+    if ssh_password:
+        if not sshpass_available:
+            raise RuntimeError(
+                "SSH password was provided, but sshpass is not installed.\n\n"
+                "Install sshpass:\n"
+                "  brew install sshpass\n\n"
+                "Or configure SSH key authentication and retry."
+            )
+        command = ["sshpass", "-p", ssh_password, *base_ssh_command, ssh_target]
     else:
-        # Fallback: try SSH key auth without password
-        command = [
-            "ssh",
-            "-N",
-            "-L",
-            bind_spec,
-            "-p",
-            str(settings["ssh_port"]),
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ConnectTimeout=10",
-            "-o", "UserKnownHostsFile=/dev/null",
-            ssh_target,
-        ]
+        # Force non-interactive key auth path for faster failures.
+        base_ssh_command.extend(["-o", "BatchMode=yes"])
+        command = [*base_ssh_command, ssh_target]
 
     # Start tunnel process
     try:
@@ -111,8 +151,8 @@ def _start_ssh_tunnel(settings, get_password_func=None):
             f"Failed to start SSH tunnel: {error}"
         )
 
-    # Wait for tunnel to become ready (up to 90 seconds)
-    max_wait_iterations = 180
+    # Wait for tunnel to become ready (configurable timeout)
+    max_wait_iterations = max(1, int(ssh_tunnel_wait_seconds / poll_interval))
     for iteration in range(max_wait_iterations):
         # Check if process exited early (indicates failure)
         if process.poll() is not None:
@@ -129,10 +169,10 @@ def _start_ssh_tunnel(settings, get_password_func=None):
             break
         
         # Check if port is now open
-        if _is_tcp_port_open(local_host, local_port, timeout=0.5):
+        if _is_tcp_port_open(local_host, local_port, timeout=poll_interval):
             return process
         
-        time.sleep(0.5)
+        time.sleep(poll_interval)
 
     # Timeout reached
     process.terminate()
@@ -142,7 +182,7 @@ def _start_ssh_tunnel(settings, get_password_func=None):
         process.kill()
     
     raise RuntimeError(
-        f"SSH tunnel did not open local port {local_port} within {max_wait_iterations * 0.5:.0f}s.\n"
+        f"SSH tunnel did not open local port {local_port} within {max_wait_iterations * poll_interval:.0f}s.\n"
         "The SSH process may have encountered an authentication issue.\n"
         "Verify SSH password and connectivity, then retry."
     )

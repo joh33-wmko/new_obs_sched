@@ -384,6 +384,24 @@ def get_mysql_connection_settings(section_name):
     except (TypeError, ValueError):
         mysql_remote_port = 3306
 
+    ssh_connect_timeout_value = db_config.get("SSH_CONNECT_TIMEOUT", 10)
+    try:
+        ssh_connect_timeout = int(ssh_connect_timeout_value)
+    except (TypeError, ValueError):
+        ssh_connect_timeout = 10
+
+    ssh_tunnel_wait_seconds_value = db_config.get("SSH_TUNNEL_WAIT_SECONDS", 20)
+    try:
+        ssh_tunnel_wait_seconds = float(ssh_tunnel_wait_seconds_value)
+    except (TypeError, ValueError):
+        ssh_tunnel_wait_seconds = 20.0
+
+    ssh_tunnel_poll_interval_value = db_config.get("SSH_TUNNEL_POLL_INTERVAL", 0.25)
+    try:
+        ssh_tunnel_poll_interval = float(ssh_tunnel_poll_interval_value)
+    except (TypeError, ValueError):
+        ssh_tunnel_poll_interval = 0.25
+
     return {
         "section": section_name,
         "host": host,
@@ -397,6 +415,9 @@ def get_mysql_connection_settings(section_name):
         "ssh_user": db_config.get("SSH_USER"),
         "ssh_port": ssh_port,
         "ssh_key_file": db_config.get("SSH_KEY_FILE") or LIVE_CONFIG.get("SSH_KEY_FILE"),
+        "ssh_connect_timeout": ssh_connect_timeout,
+        "ssh_tunnel_wait_seconds": ssh_tunnel_wait_seconds,
+        "ssh_tunnel_poll_interval": ssh_tunnel_poll_interval,
         "mysql_remote_host": db_config.get("MYSQL_REMOTE_HOST") or "127.0.0.1",
         "mysql_remote_port": mysql_remote_port,
     }
@@ -445,7 +466,7 @@ def connect_to_remote_mysql_db():
 
         connection = None
         try:
-            tunnel_process = _start_ssh_tunnel(settings, get_password_func=get_ssh_password)
+            tunnel_process = _start_ssh_tunnel(settings, password_provider=get_ssh_password)
             db_name = settings["database"]
             connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
             
@@ -613,7 +634,7 @@ def preflight_mysql_connection_check():
 
         connection = None
         try:
-            tunnel_process = _start_ssh_tunnel(settings, get_password_func=get_ssh_password)
+            tunnel_process = _start_ssh_tunnel(settings, password_provider=get_ssh_password)
             query_timeout = get_config("DB_SERVER", "QUERY_TIMEOUT", 5)
             connection = pymysql.connect(
                 host=settings["host"],
