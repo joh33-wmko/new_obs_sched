@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import requests
+from openpyxl import load_workbook
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 
@@ -714,8 +715,11 @@ def pick_file(root):
             pass
 
 def get_sheet_names(file_path):
-    xls = pd.ExcelFile(file_path, engine="openpyxl")
-    return xls.sheet_names
+    workbook = load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        return list(workbook.sheetnames)
+    finally:
+        workbook.close()
 
 def choose_sheet(sheet_names, file_path, default_sheet=None, parent=None):
     dialog = tk.Toplevel(parent)
@@ -852,9 +856,6 @@ def close_calc_process(process):
     if process is None:
         return
 
-    if process.poll() is not None:
-        return
-
     # On macOS, ask the app to quit first to avoid crash-recovery prompts.
     if sys.platform == "darwin":
         try:
@@ -865,10 +866,14 @@ def close_calc_process(process):
                 stderr=subprocess.DEVNULL,
                 timeout=3,
             )
-            process.wait(timeout=8)
+            if process.poll() is None:
+                process.wait(timeout=8)
             return
         except Exception:
             pass
+
+    if process.poll() is not None:
+        return
 
     process.terminate()
     try:
