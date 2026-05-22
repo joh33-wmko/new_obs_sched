@@ -1132,7 +1132,11 @@ def write_swoc_member_list_log(members, changed=True):
     header = f"[{timestamp}] SWOC Member List\n"
 
     if changed:
-        log_lines = [header]
+        log_lines = [
+            header,
+            "  The new member rotation order has been changed.",
+            "  New rotation order:",
+        ]
         for i, member in enumerate(members, start=1):
             line = (
                 f"  #{i:02d} {member.get('name')} ({member.get('alias', '')})"
@@ -1142,13 +1146,568 @@ def write_swoc_member_list_log(members, changed=True):
     else:
         log_lines = [
             header,
-            "  No change to swoc rotation member list or rotation order.\n",
+            "  No change to member rotation order was made.\n",
         ]
 
     with open(log_file, "a", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
     return log_file
+
+
+# ---------------------------------------------------------------------------
+# SWOC schedule generation helpers
+# ---------------------------------------------------------------------------
+
+def _get_upcoming_semester_info():
+    """Return info dict for the next upcoming semester relative to today.
+
+    Returns a dict: {"label": str, "start": date, "end": date}.
+    """
+    today = datetime.date.today()
+    sem_a_cfg = get_config("SWOC_ROTATION", "SEMESTER_A", {})
+    sem_b_cfg = get_config("SWOC_ROTATION", "SEMESTER_B", {})
+
+    sem_a_start = sem_a_end = sem_a_label = None
+    sem_b_start = sem_b_end = sem_b_label = None
+
+    try:
+        sem_a_start = datetime.date.fromisoformat(sem_a_cfg.get("start_date", ""))
+        sem_a_end = datetime.date.fromisoformat(sem_a_cfg.get("end_date", ""))
+        sem_a_label = f"{sem_a_start.year}A"
+    except (ValueError, AttributeError, TypeError):
+        pass
+
+    try:
+        sem_b_start = datetime.date.fromisoformat(sem_b_cfg.get("start_date", ""))
+        sem_b_end = datetime.date.fromisoformat(sem_b_cfg.get("end_date", ""))
+        sem_b_label = f"{sem_b_start.year}B"
+    except (ValueError, AttributeError, TypeError):
+        pass
+
+    candidates = []
+    if sem_a_start and sem_a_start > today and sem_a_end:
+        candidates.append({"label": sem_a_label, "start": sem_a_start, "end": sem_a_end})
+    if sem_b_start and sem_b_start > today and sem_b_end:
+        candidates.append({"label": sem_b_label, "start": sem_b_start, "end": sem_b_end})
+
+    if candidates:
+        candidates.sort(key=lambda x: x["start"])
+        return candidates[0]
+
+    # Both semesters in past or current — return B as fallback
+    if sem_b_start and sem_b_end:
+        return {"label": sem_b_label or "Unknown", "start": sem_b_start, "end": sem_b_end}
+    return {"label": "Unknown", "start": today, "end": today}
+
+
+def _reveal_in_finder_and_refocus(path, refocus_widget):
+    """Reveal file in Finder (macOS) and schedule focus return to refocus_widget."""
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(["open", "-R", str(path)])
+        except Exception:
+            pass
+        if refocus_widget:
+            refocus_widget.after(400, lambda: (
+                refocus_widget.lift(),
+                refocus_widget.focus_force(),
+            ))
+
+
+def _show_log_saved_and_prompt(log_file, parent):
+    """Show 'log saved' notification with Close / Continue buttons.
+
+    Returns 'close' or 'continue'.
+    """
+    owner = parent or getattr(tk, "_default_root", None)
+    notify = tk.Toplevel(owner)
+    notify.title("SWOC Member Log Saved")
+    _set_dialog_geometry(notify, 700, 240, min_width=540, min_height=200)
+    notify.resizable(True, True)
+
+    result = {"action": "close"}
+
+    msg = (
+        "SWOC member list log was updated.\n\n"
+        f"Log file:  {log_file.name}\n"
+        f"Path:  {log_file}\n\n"
+        "Review the log file in Finder if desired, then choose an action below."
+    )
+    final_width, _ = _set_dialog_geometry(notify, 700, 260, min_width=540, min_height=220)
+    wrap_length = max(480, final_width - 40)
+    tk.Label(
+        notify,
+        text=msg,
+        padx=16,
+        pady=16,
+        justify="left",
+        anchor="w",
+        wraplength=wrap_length,
+    ).pack(fill="both", expand=True)
+
+    btn_frame = tk.Frame(notify)
+    btn_frame.pack(pady=(0, 12))
+
+    def on_close():
+        result["action"] = "close"
+        notify.destroy()
+
+    def on_continue():
+        result["action"] = "continue"
+        notify.destroy()
+
+    tk.Button(btn_frame, text="Close", command=on_close, width=10).pack(side="left", padx=8)
+    tk.Button(btn_frame, text="Continue →", command=on_continue, width=18).pack(side="left", padx=8)
+
+    notify.protocol("WM_DELETE_WINDOW", on_close)
+    notify.lift()
+    notify.focus_force()
+    notify.attributes("-topmost", True)
+    notify.grab_set()
+    notify.wait_window()
+
+    return result["action"]
+
+
+def show_swoc_date_range_dialog(parent, default_start, default_end, semester_label):
+    """Prompt for start/end dates for SWOC schedule generation.
+
+    Returns (start_date, end_date) or None if cancelled.
+    """
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(f"SWOC Schedule Date Range — {semester_label}")
+    _set_dialog_geometry(dialog, 460, 230, min_width=400, min_height=210)
+    dialog.resizable(False, False)
+
+    result_dates = {
+        "start": default_start,
+        "end": default_end,
+        "updated": False,
+    }
+
+    frame = tk.Frame(dialog, padx=16, pady=14)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(frame, text=f"Semester: {semester_label}", font=("Arial", 11, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+    )
+
+    tk.Label(frame, text="Start date (YYYY-MM-DD):").grid(row=1, column=0, sticky="w", pady=4)
+    start_entry = tk.Entry(frame, width=16)
+    start_entry.insert(0, default_start.isoformat())
+    start_entry.grid(row=1, column=1, sticky="w", pady=4, padx=(8, 0))
+
+    tk.Label(frame, text="End date (YYYY-MM-DD):").grid(row=2, column=0, sticky="w", pady=4)
+    end_entry = tk.Entry(frame, width=16)
+    end_entry.insert(0, default_end.isoformat())
+    end_entry.grid(row=2, column=1, sticky="w", pady=4, padx=(8, 0))
+
+    btn_frame = tk.Frame(frame)
+    btn_frame.grid(row=3, column=0, columnspan=2, pady=(14, 0))
+
+    def on_ok():
+        try:
+            start = datetime.date.fromisoformat(start_entry.get().strip())
+            end = datetime.date.fromisoformat(end_entry.get().strip())
+        except ValueError:
+            show_focused_info_dialog("Invalid Date", "Please enter dates in YYYY-MM-DD format.", dialog)
+            return
+        if end < start:
+            show_focused_info_dialog("Invalid Range", "End date must be on or after start date.", dialog)
+            return
+        result_dates["start"] = start
+        result_dates["end"] = end
+        result_dates["updated"] = True
+        dialog.destroy()
+
+    def on_cancel():
+        dialog.destroy()
+
+    tk.Button(btn_frame, text="OK", command=on_ok, width=8).pack(side="left", padx=6)
+    tk.Button(btn_frame, text="Cancel", command=on_cancel, width=8).pack(side="left", padx=6)
+
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+    if result_dates["updated"]:
+        return result_dates["start"], result_dates["end"]
+    return None
+
+
+def _write_swoc_generation_log(
+    semester_label,
+    start_date,
+    end_date,
+    last_alias,
+    last_date,
+    start_index,
+    active_members,
+    statements_count,
+):
+    """Write SWOC generation details and query info to a log file."""
+    data_dir = ensure_data_dir()
+    log_file = data_dir / "swoc_schedule_generation.log"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = [
+        f"[{timestamp}] SWOC Schedule Generation",
+        f"Semester: {semester_label}",
+        f"Date range: {start_date} to {end_date}",
+        "",
+        "Query used:",
+        "SELECT Alias, Date FROM nightStaff WHERE Type = 'swoc' ORDER BY Date DESC LIMIT 1;",
+        f"Last swoc alias/date: {last_alias or 'N/A'} / {last_date or 'N/A'}",
+        f"Starting index after advance: {start_index}",
+        (
+            "Starting alias after advance: "
+            f"{active_members[start_index].get('alias') if active_members else 'N/A'}"
+        ),
+        f"Total generated INSERT statements: {statements_count}",
+        "",
+    ]
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return log_file
+
+
+def _generate_swoc_insert_statements(members, start_date, end_date, start_index):
+    """Generate one INSERT per day cycling through active members.
+
+    Returns list of SQL strings.
+    """
+    if not members:
+        return []
+
+    statements = []
+    current = start_date
+    idx = start_index % len(members)
+    one_day = datetime.timedelta(days=1)
+
+    while current <= end_date:
+        alias = members[idx].get("alias", "")
+        date_str = current.isoformat()
+        stmt = (
+            f"insert into nightStaff set "
+            f"Date='{date_str}', TelNr='0', Alias='{alias}', Type='swoc';"
+        )
+        statements.append(stmt)
+        idx = (idx + 1) % len(members)
+        current += one_day
+
+    return statements
+
+
+def _show_swoc_sql_preview_dialog(parent, sql_file, semester_label):
+    """Show SQL file path with Exit / Publish buttons. Returns 'exit' or 'publish'."""
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(f"SWOC Schedule SQL — {semester_label}")
+    _set_dialog_geometry(dialog, 720, 280, min_width=560, min_height=240)
+    dialog.resizable(True, True)
+
+    result = {"action": "exit"}
+
+    msg = (
+        f"SWOC INSERT statements have been written.\n\n"
+        f"SQL file:  {sql_file.name}\n"
+        f"Path:  {sql_file}\n\n"
+        "Review the file in Finder before publishing.\n"
+        "Press Exit to stop here, or Publish to insert into keckOperations."
+    )
+    final_width, _ = _set_dialog_geometry(dialog, 720, 280, min_width=560, min_height=240)
+    wrap_length = max(500, final_width - 40)
+    tk.Label(
+        dialog,
+        text=msg,
+        padx=16,
+        pady=16,
+        justify="left",
+        anchor="w",
+        wraplength=wrap_length,
+    ).pack(fill="both", expand=True)
+
+    btn_frame = tk.Frame(dialog)
+    btn_frame.pack(pady=(0, 12))
+
+    def on_exit():
+        result["action"] = "exit"
+        dialog.destroy()
+
+    def on_publish():
+        result["action"] = "publish"
+        dialog.destroy()
+
+    tk.Button(btn_frame, text="Exit", command=on_exit, width=10).pack(side="left", padx=8)
+    tk.Button(
+        btn_frame,
+        text=f"Publish SWOC schedule for semester {semester_label}",
+        command=on_publish,
+    ).pack(side="left", padx=8)
+
+    dialog.protocol("WM_DELETE_WINDOW", on_exit)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+    return result["action"]
+
+
+def _show_swoc_results_dialog(parent, stats, result_file, semester_label):
+    """Show INSERT results summary; OK button opens the results file."""
+    total = stats.get("total", 0)
+    success = stats.get("success", 0)
+    already_exists = stats.get("already_exists", 0)
+    failed = stats.get("failed", 0)
+
+    # Collect per-row details for failures and duplicates
+    failed_lines = []
+    skipped_lines = []
+    for stmt, status, error in stats.get("statements", []):
+        date_m = re.search(r"Date='([^']+)'", stmt)
+        alias_m = re.search(r"Alias='([^']+)'", stmt)
+        label = (
+            f"{date_m.group(1) if date_m else '?'} / "
+            f"{alias_m.group(1) if alias_m else '?'}"
+        )
+        if status == "FAILED":
+            err_snippet = (error[:60] if error else "")
+            failed_lines.append(f"  \u2717 {label}  [{err_snippet}]")
+        elif status == "DUPLICATE":
+            skipped_lines.append(f"  \u2298 {label}")
+
+    parts = [
+        f"SWOC Schedule Insert Results \u2014 {semester_label}\n",
+        f"Total attempted:           {total}",
+        f"\u2713 Inserted successfully:   {success}",
+        f"\u2298 Already existed (skip):  {already_exists}",
+        f"\u2717 Failed:                  {failed}",
+    ]
+    if skipped_lines:
+        parts.append(f"\nSkipped ({min(len(skipped_lines), 20)} of {len(skipped_lines)} shown):")
+        parts.extend(skipped_lines[:20])
+        if len(skipped_lines) > 20:
+            parts.append(f"  \u2026 and {len(skipped_lines) - 20} more (see results file)")
+    if failed_lines:
+        parts.append(f"\nFailed ({min(len(failed_lines), 20)} of {len(failed_lines)} shown):")
+        parts.extend(failed_lines[:20])
+        if len(failed_lines) > 20:
+            parts.append(f"  \u2026 and {len(failed_lines) - 20} more (see results file)")
+    parts.append(f"\nResults file:  {result_file.name}")
+    parts.append(f"Path:  {result_file}")
+
+    msg = "\n".join(parts)
+
+    owner = parent or getattr(tk, "_default_root", None)
+    dialog = tk.Toplevel(owner)
+    dialog.title(f"SWOC Publish Results \u2014 {semester_label}")
+    est_w, est_h = _estimate_message_dialog_size(msg)
+    _set_dialog_geometry(dialog, max(est_w, 700), max(est_h, 360), min_width=580, min_height=320)
+    dialog.resizable(True, True)
+
+    outer = tk.Frame(dialog)
+    outer.pack(fill="both", expand=True)
+
+    sb = tk.Scrollbar(outer)
+    sb.pack(side="right", fill="y")
+    txt = tk.Text(outer, wrap="word", yscrollcommand=sb.set, padx=12, pady=12)
+    txt.insert("1.0", msg)
+    txt.config(state="disabled")
+    txt.pack(side="left", fill="both", expand=True)
+    sb.config(command=txt.yview)
+
+    def on_ok():
+        dialog.destroy()
+        if sys.platform == "darwin":
+            try:
+                subprocess.Popen(["open", str(result_file)])
+            except Exception:
+                pass
+
+    tk.Button(dialog, text="OK \u2014 View Results", command=on_ok).pack(pady=(0, 12))
+
+    dialog.protocol("WM_DELETE_WINDOW", on_ok)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+
+
+def run_swoc_schedule_generation(parent=None):
+    """Orchestrate the full SWOC schedule generation and publish flow."""
+    # 1. Upcoming semester defaults
+    sem_info = _get_upcoming_semester_info()
+    semester_label = sem_info["label"]
+    default_start = sem_info["start"]
+    default_end = sem_info["end"]
+
+    # 2. Date range dialog
+    dates = show_swoc_date_range_dialog(parent, default_start, default_end, semester_label)
+    if not dates:
+        return
+    start_date = dates[0]
+    end_date = dates[1]
+
+    # 3. Active members sorted by rotation_order
+    all_members = load_swoc_members()
+    active_members = [m for m in all_members if m.get("active", True)]
+    if not active_members:
+        show_focused_info_dialog(
+            "No Active Members",
+            "No active SWOC rotation members found. Add or activate members before generating a schedule.",
+            parent,
+        )
+        return
+
+    # 4. Query last SWOC entry to determine starting index
+    start_index = 0
+    last_alias = None
+    last_date = None
+    candidates = get_mysql_connection_candidates()
+    if candidates:
+        try:
+            pymysql = importlib.import_module("pymysql")
+            connect_timeout = get_config("DB_SERVER", "CONNECT_TIMEOUT", 10)
+
+            def _query_last_swoc(connection, _settings):
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT Alias, Date FROM nightStaff "
+                        "WHERE Type = 'swoc' ORDER BY Date DESC LIMIT 1"
+                    )
+                    return cursor.fetchone()  # (alias, date) or None
+
+            query_result = run_with_mysql_connection(
+                candidates,
+                pymysql,
+                _query_last_swoc,
+                connect_timeout=connect_timeout,
+                password_provider=get_ssh_password,
+            )
+            if query_result["ok"] and query_result["result"]:
+                last_alias, last_date = query_result["result"]
+                alias_to_idx = {m.get("alias"): i for i, m in enumerate(active_members)}
+                if last_alias in alias_to_idx:
+                    last_idx = alias_to_idx[last_alias]
+                    start_index = (last_idx + 1) % len(active_members)
+                    _debug_log(
+                        f"Last SWOC entry: alias={last_alias}, date={last_date}. "
+                        f"Starting rotation from index {start_index} "
+                        f"({active_members[start_index].get('alias')})"
+                    )
+        except Exception as exc:
+            _debug_log(f"Could not query last SWOC entry (non-fatal): {exc}")
+
+    # 5. Generate INSERT statements
+    statements = _generate_swoc_insert_statements(active_members, start_date, end_date, start_index)
+    if not statements:
+        show_focused_info_dialog(
+            "No Statements Generated",
+            f"No INSERT statements were generated for {start_date} to {end_date}.",
+            parent,
+        )
+        return
+
+    # 6. Write SQL file
+    data_dir = ensure_data_dir()
+    sql_file = data_dir / f"{semester_label}_SWOC_Schedule.sql"
+    sql_file.write_text("\n".join(statements) + "\n", encoding="utf-8")
+    _debug_log(f"Wrote {len(statements)} SWOC INSERT statements to {sql_file}")
+
+    generation_log = _write_swoc_generation_log(
+        semester_label=semester_label,
+        start_date=start_date,
+        end_date=end_date,
+        last_alias=last_alias,
+        last_date=last_date,
+        start_index=start_index,
+        active_members=active_members,
+        statements_count=len(statements),
+    )
+
+    # Reveal generation log in Finder first (includes query details), then return focus.
+    _reveal_in_finder_and_refocus(generation_log, parent)
+
+    # 7. Reveal SQL file in Finder; return focus to parent
+    _reveal_in_finder_and_refocus(sql_file, parent)
+
+    # 8. SQL preview dialog — Exit or Publish
+    action = _show_swoc_sql_preview_dialog(parent, sql_file, semester_label)
+    if action != "publish":
+        return
+
+    # 9. Publish to database
+    candidates = get_mysql_connection_candidates()
+    if not candidates:
+        show_focused_info_dialog(
+            "No DB Config",
+            "No MySQL connection settings found. Configure DB_SERVER in config.live.ini.",
+            parent,
+        )
+        return
+
+    try:
+        pymysql = importlib.import_module("pymysql")
+    except ImportError:
+        show_focused_info_dialog(
+            "Missing pymysql",
+            "PyMySQL is not installed. Install it to publish to the database.",
+            parent,
+        )
+        return
+
+    insert_commit_interval = get_config("DB_SERVER", "INSERT_COMMIT_INTERVAL", 200)
+    insert_use_ignore = get_config("DB_SERVER", "INSERT_USE_IGNORE", True)
+    insert_detail_limit = get_config("DB_SERVER", "INSERT_DETAIL_LIMIT", 300)
+
+    def _publish_operation(connection, _settings):
+        stats = apply_insert_statements_to_database(
+            connection,
+            sql_file,
+            commit_interval=insert_commit_interval,
+            use_insert_ignore=insert_use_ignore,
+            detail_limit=insert_detail_limit,
+        )
+        result_file = write_insert_results_to_file(stats, sql_file, data_dir)
+        return {"stats": stats, "result_file": result_file}
+
+    publish_result = run_with_mysql_connection(
+        candidates,
+        pymysql,
+        _publish_operation,
+        connect_timeout=get_config("DB_SERVER", "CONNECT_TIMEOUT", 10),
+        password_provider=get_ssh_password,
+    )
+    if not publish_result["ok"]:
+        show_focused_info_dialog(
+            "Database connection failed",
+            "Could not connect to keckOperations.\n\n" + "\n".join(publish_result["failures"]),
+            parent,
+        )
+        return
+
+    payload = publish_result["result"]
+    stats = payload["stats"]
+    result_file = payload["result_file"]
+
+    # 10. Reveal results in Finder, show summary
+    _reveal_in_finder_and_refocus(result_file, parent)
+    _show_swoc_results_dialog(parent, stats, result_file, semester_label)
+
+
+# ---------------------------------------------------------------------------
+# End SWOC schedule generation helpers
+# ---------------------------------------------------------------------------
 
 
 def add_swoc_audit_log_entry(change_type, member_name, old_values, new_values, reason=""):
@@ -1355,42 +1914,21 @@ def show_member_management_dialog(parent=None):
         current_state = get_member_list_state(members)
         has_changes[0] = current_state != initial_state
         if "widget" in close_button_holder and close_button_holder["widget"]:
-            button_text = "Save" if has_changes[0] else "Close"
+            button_text = "Save" if has_changes[0] else "Continue"
             close_button_holder["widget"].config(text=button_text)
 
     def close_and_log():
-        """Close dialog and notify user about log path behavior."""
+        """Log member-order status and continue to SWOC schedule generation."""
         mark_changes()
-        data_dir = ensure_data_dir()
-        log_file = data_dir / "swoc_member_list.log"
 
         if has_changes[0]:
-            log_file = write_swoc_member_list_log(members, changed=True)
-            if sys.platform == "darwin":
-                try:
-                    subprocess.Popen(["open", "-R", str(log_file)])
-                except Exception:
-                    pass
-            show_focused_info_dialog(
-                "SWOC Member Log Saved",
-                (
-                    "SWOC member list log was updated.\n\n"
-                    f"Log file: {log_file.name}\n"
-                    f"Path: {log_file}"
-                ),
-                dialog,
-            )
-        else:
-            show_focused_info_dialog(
-                "No Changes",
-                (
-                    "Button was labeled Close.\n"
-                    "Filename path was not changed."
-                ),
-                dialog,
-            )
+            save_swoc_members(members)
+
+        log_file = write_swoc_member_list_log(members, changed=has_changes[0])
+        _reveal_in_finder_and_refocus(log_file, dialog)
 
         dialog.destroy()
+        run_swoc_schedule_generation(parent=None)
 
     
     # Create a frame with scrollbar
@@ -1807,7 +2345,7 @@ def show_member_management_dialog(parent=None):
     tk.Button(button_frame, text="Add New", command=add_new_member).pack(side="left", padx=4)
     tk.Button(button_frame, text="Edit Selected", command=edit_member).pack(side="left", padx=4)
     tk.Button(button_frame, text="Remove Selected", command=remove_member).pack(side="left", padx=4)
-    close_button_holder["widget"] = tk.Button(button_frame, text="Close", command=close_and_log)
+    close_button_holder["widget"] = tk.Button(button_frame, text="Continue", command=close_and_log)
     close_button_holder["widget"].pack(side="right", padx=4)
     
     dialog.protocol("WM_DELETE_WINDOW", close_and_log)
