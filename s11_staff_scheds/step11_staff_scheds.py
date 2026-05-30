@@ -3,9 +3,10 @@
 # This script converts an Excel file to CSV format and optionally uploads it to the staff schedule site.
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 import datetime
 import importlib
+import getpass
 import html
 import re
 import shutil
@@ -81,18 +82,86 @@ def get_ssh_password(settings):
     if cached:
         return cached
 
-    parent = getattr(tk, "_default_root", None)
     display_host = settings.get("ssh_hostname") or settings.get("ssh_host")
     prompt = (
         f"Enter SSH password for {settings.get('ssh_user')}@{display_host}"
         #f" (port {settings.get('ssh_port')})"
     )
-    password = simpledialog.askstring("SSH Password Required", prompt, show="*", parent=parent)
+    password = _prompt_for_ssh_password("SSH Password Required", prompt)
     if not password:
         raise RuntimeError("SSH password entry was cancelled.")
 
     SSH_PASSWORD_CACHE[cache_key] = password
     return password
+
+
+def _prompt_for_ssh_password(title, prompt, parent=None):
+    """Show a modal password prompt that stays visible even when the main window is hidden."""
+    owner = parent or getattr(tk, "_default_root", None)
+    use_owner = None
+    if owner is not None:
+        try:
+            if owner.winfo_exists() and str(owner.state()) != "withdrawn":
+                use_owner = owner
+        except Exception:
+            use_owner = None
+
+    dialog = tk.Toplevel(use_owner) if use_owner is not None else tk.Toplevel()
+    dialog.title(title)
+    dialog.resizable(False, False)
+    _set_dialog_geometry(dialog, 560, 220, min_width=460, min_height=200, max_width=700)
+    if use_owner is not None:
+        dialog.transient(use_owner)
+
+    frame = tk.Frame(dialog, padx=16, pady=16)
+    frame.pack(fill="both", expand=True)
+
+    tk.Label(
+        frame,
+        text=prompt,
+        justify="left",
+        anchor="w",
+        wraplength=480,
+    ).pack(fill="x", pady=(0, 12))
+
+    password_var = tk.StringVar()
+    entry = tk.Entry(frame, textvariable=password_var, show="*")
+    entry.pack(fill="x")
+    entry.focus_set()
+
+    result = {"password": ""}
+
+    def accept():
+        result["password"] = password_var.get()
+        dialog.destroy()
+
+    def cancel():
+        dialog.destroy()
+
+    button_frame = tk.Frame(frame)
+    button_frame.pack(fill="x", pady=(16, 0))
+    tk.Button(button_frame, text="Cancel", command=cancel).pack(side="right", padx=(6, 0))
+    tk.Button(button_frame, text="OK", command=accept).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.bind("<Return>", lambda _event: accept())
+    dialog.bind("<Escape>", lambda _event: cancel())
+    dialog.lift()
+    dialog.focus_force()
+    dialog.attributes("-topmost", True)
+    dialog.grab_set()
+    dialog.wait_window()
+    password = result["password"] or None
+    if password:
+        return password
+
+    # Fallback for environments where Tk dialog focus/visibility is unreliable.
+    if sys.stdin and sys.stdin.isatty():
+        try:
+            return getpass.getpass(f"{prompt}: ") or None
+        except Exception:
+            return None
+    return None
 
 
 class LegacyTLSAdapter(HTTPAdapter):
@@ -374,8 +443,84 @@ def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
     return get_config("NEW_OBS_SEM", "DEFAULT_UPLOAD_TYPE", "eeoc")
 
 
+def _resolve_db_config(section_name):
+    """Return merged DB config and resolved section name.
+
+    If ACTIVE_DB_SERVER_SECTION is set, DB_SERVER values are treated as defaults
+    and overridden by the active profile section.
+    """
+    base_config = LIVE_CONFIG.get("DB_SERVER", {}) if section_name == "DB_SERVER" else {}
+    resolved_section = section_name
+
+    if section_name == "DB_SERVER":
+        active_section = LIVE_CONFIG.get("ACTIVE_DB_SERVER_SECTION")
+        if isinstance(active_section, str) and active_section in LIVE_CONFIG:
+            resolved_section = active_section
+
+    profile_config = LIVE_CONFIG.get(resolved_section, {})
+    merged_config = {}
+    if isinstance(base_config, dict):
+        merged_config.update(base_config)
+    if isinstance(profile_config, dict):
+        merged_config.update(profile_config)
+
+    return merged_config, resolved_section
+
+
+def _apply_active_db_target(target_mode):
+    """Set ACTIVE_DB_HOST/ACTIVE_DB_HOSTNAME in memory from clone/prod values."""
+    db_config = LIVE_CONFIG.get("DB_SERVER")
+    if not isinstance(db_config, dict):
+        return
+
+    mode = (target_mode or "pre-release").strip().lower()
+    if mode == "release":
+        active_host = db_config.get("SSH_DB_PROD_HOST") or db_config.get("SSH_PROD_HOST")
+        active_hostname = db_config.get("SSH_DB_PROD_HOSTNAME") or db_config.get("SSH_PROD_HOSTNAME")
+    else:
+        active_host = db_config.get("SSH_DB_CLONE_HOST") or db_config.get("SSH_CLONE_HOST")
+        active_hostname = db_config.get("SSH_DB_CLONE_HOSTNAME") or db_config.get("SSH_CLONE_HOSTNAME")
+
+    if active_host:
+        db_config["ACTIVE_DB_HOST"] = active_host
+    if active_hostname:
+        db_config["ACTIVE_DB_HOSTNAME"] = active_hostname
+
+
+def _detect_active_db_target_mode():
+    """Infer active target mode from ACTIVE_DB_HOST and configured clone/prod hosts."""
+    db_config = LIVE_CONFIG.get("DB_SERVER", {})
+    if not isinstance(db_config, dict):
+        return "pre-release"
+
+    active_host = db_config.get("ACTIVE_DB_HOST") or db_config.get("SSH_HOST")
+    prod_host = db_config.get("SSH_DB_PROD_HOST") or db_config.get("SSH_PROD_HOST")
+    if active_host and prod_host and str(active_host) == str(prod_host):
+        return "release"
+    return "pre-release"
+
+
+def _current_db_target_label():
+    """Return display label for currently selected DB target."""
+    db_config = LIVE_CONFIG.get("DB_SERVER", {})
+    if not isinstance(db_config, dict):
+        return "Unknown DB Target"
+
+    active_host = db_config.get("ACTIVE_DB_HOST") or db_config.get("SSH_HOST") or "unknown-host"
+    mode = _detect_active_db_target_mode()
+    mode_label = "Release" if mode == "release" else "Pre-Release"
+    return f"{mode_label} ({active_host})"
+
+
 def get_mysql_connection_settings(section_name):
-    db_config = LIVE_CONFIG.get(section_name, {})
+    db_config, resolved_section = _resolve_db_config(section_name)
+
+    active_ssh_host = db_config.get("ACTIVE_DB_HOST") or db_config.get("SSH_HOST")
+    active_ssh_hostname = (
+        db_config.get("ACTIVE_DB_HOSTNAME")
+        or db_config.get("ACTIVE_DB_HOSTNME")
+        or db_config.get("SSH_HOSTNAME")
+    )
 
     host = db_config.get("DB_HOST")
     user = db_config.get("DB_USER")
@@ -419,15 +564,15 @@ def get_mysql_connection_settings(section_name):
         ssh_tunnel_poll_interval = 0.25
 
     return {
-        "section": section_name,
+        "section": resolved_section,
         "host": host,
         "user": user,
         "password": password,
         "database": database,
         "port": port,
-        "ssh_tunnel_enabled": bool(db_config.get("SSH_HOST") and db_config.get("SSH_USER")),
-        "ssh_host": db_config.get("SSH_HOST"),
-        "ssh_hostname": db_config.get("SSH_HOSTNAME"),
+        "ssh_tunnel_enabled": bool(active_ssh_host and db_config.get("SSH_USER")),
+        "ssh_host": active_ssh_host,
+        "ssh_hostname": active_ssh_hostname,
         "ssh_user": db_config.get("SSH_USER"),
         "ssh_port": ssh_port,
         "ssh_key_file": db_config.get("SSH_KEY_FILE") or LIVE_CONFIG.get("SSH_KEY_FILE"),
@@ -671,15 +816,7 @@ def upload_csv_to_staff_site(csv_path, upload_type, verbose_enabled):
 
 
 def open_file_in_integrated_browser(output_file):
-    # Keep focus in Finder on macOS instead of foregrounding VS Code.
-    if sys.platform == "darwin":
-        try:
-            subprocess.Popen(["open", "-R", str(output_file)])
-            return output_file
-        except Exception:
-            subprocess.Popen(["open", str(output_file)])
-            return output_file
-
+    # Keep workflow on one desktop: do not auto-open Finder here.
     return output_file
 
 
@@ -894,14 +1031,15 @@ def focus_converted_file(file_path):
     if sys.platform == "darwin":
         target = Path(file_path)
         if target.is_dir():
-            subprocess.Popen(["open", str(target)])
+            subprocess.Popen(["open", "-g", str(target)])
         else:
-            subprocess.Popen(["open", "-R", str(target)])
+            subprocess.Popen(["open", "-g", "-R", str(target)])
 
 
 def show_final_completion_dialog(output=None, upload_message=None, sql_file=None, parent=None):
     dialog = tk.Toplevel(parent)
-    dialog.title("Conversions Complete")
+    db_target = _current_db_target_label()
+    dialog.title(f"Conversions Complete — {db_target}")
     dialog.resizable(True, True)
 
     action = [""]
@@ -921,7 +1059,8 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
 
     export_section = ""
     if output and upload_message:
-        export_section = f"{upload_message}\n\n"
+        export_section = f"Database target: {db_target}\n\n"
+        export_section += f"{upload_message}\n\n"
         export_section += f"Converted CSV file:\n{output}\n\n"
         if sql_file:
             export_section += f"Saved SQL file:\n{sql_file}\n\nand is ready for database update.\n\n"
@@ -947,9 +1086,7 @@ def show_final_completion_dialog(output=None, upload_message=None, sql_file=None
             wraplength=wrap_length
         ).pack()
 
-    # When completion is shown, immediately reveal/select the generated SQL file.
-    if sql_file:
-        focus_converted_file(sql_file)
+    # Keep focus on the completion dialog; do not auto-reveal Finder here.
 
     dialog.protocol("WM_DELETE_WINDOW", cancel)
     dialog.lift()
@@ -1202,17 +1339,27 @@ def _get_upcoming_semester_info():
 
 
 def _reveal_in_finder_and_refocus(path, refocus_widget):
-    """Reveal file in Finder (macOS) and schedule focus return to refocus_widget."""
-    if sys.platform == "darwin":
+    """Keep focus on active dialog; do not auto-open Finder during workflow."""
+    if not refocus_widget:
+        return
+
+    def _safe_refocus():
         try:
-            subprocess.Popen(["open", "-R", str(path)])
+            if not refocus_widget.winfo_exists():
+                return
+            if str(refocus_widget.state()) == "withdrawn":
+                return
+            refocus_widget.lift()
+            refocus_widget.focus_force()
         except Exception:
-            pass
-        if refocus_widget:
-            refocus_widget.after(400, lambda: (
-                refocus_widget.lift(),
-                refocus_widget.focus_force(),
-            ))
+            return
+
+    try:
+        refocus_widget.after(100, _safe_refocus)
+        refocus_widget.after(350, _safe_refocus)
+        refocus_widget.after(700, _safe_refocus)
+    except Exception:
+        return
 
 
 def _show_log_saved_and_prompt(log_file, parent):
@@ -1408,8 +1555,9 @@ def _generate_swoc_insert_statements(members, start_date, end_date, start_index)
 def _show_swoc_sql_preview_dialog(parent, sql_file, semester_label):
     """Show SQL file path with Exit / Publish buttons. Returns 'exit' or 'publish'."""
     owner = parent or getattr(tk, "_default_root", None)
+    db_target = _current_db_target_label()
     dialog = tk.Toplevel(owner)
-    dialog.title(f"SWOC Schedule SQL — {semester_label}")
+    dialog.title(f"SWOC Schedule SQL — {semester_label} — {db_target}")
     _set_dialog_geometry(dialog, 720, 280, min_width=560, min_height=240)
     dialog.resizable(True, True)
 
@@ -1417,6 +1565,7 @@ def _show_swoc_sql_preview_dialog(parent, sql_file, semester_label):
 
     msg = (
         f"SWOC INSERT statements have been written.\n\n"
+        f"Database target:  {db_target}\n\n"
         f"SQL file:  {sql_file.name}\n"
         f"Path:  {sql_file}\n\n"
         "Review the file in Finder before publishing.\n"
@@ -1448,7 +1597,7 @@ def _show_swoc_sql_preview_dialog(parent, sql_file, semester_label):
     tk.Button(btn_frame, text="Exit", command=on_exit, width=10).pack(side="left", padx=8)
     tk.Button(
         btn_frame,
-        text=f"Publish SWOC schedule for semester {semester_label}",
+        text=f"Publish SWOC schedule to {db_target}",
         command=on_publish,
     ).pack(side="left", padx=8)
 
@@ -1527,13 +1676,18 @@ def _show_swoc_results_dialog(parent, stats, result_file, semester_label):
 
     def on_ok():
         dialog.destroy()
+
+    def on_open_results():
         if sys.platform == "darwin":
             try:
-                subprocess.Popen(["open", str(result_file)])
+                subprocess.Popen(["open", "-g", "-R", str(result_file)])
             except Exception:
-                pass
+                return
 
-    tk.Button(dialog, text="OK \u2014 View Results", command=on_ok).pack(pady=(0, 12))
+    button_row = tk.Frame(dialog)
+    button_row.pack(pady=(0, 12))
+    tk.Button(button_row, text="Open Results in Finder", command=on_open_results).pack(side="left", padx=6)
+    tk.Button(button_row, text="Done", command=on_ok).pack(side="left", padx=6)
 
     dialog.protocol("WM_DELETE_WINDOW", on_ok)
     dialog.lift()
@@ -1592,7 +1746,9 @@ def run_swoc_schedule_generation(parent=None):
                 pymysql,
                 _query_last_swoc,
                 connect_timeout=connect_timeout,
-                password_provider=get_ssh_password,
+                # Optional lookup only. Skip interactive password prompts here
+                # so SWOC generation does not appear to hang after date confirmation.
+                password_provider=None,
             )
             if query_result["ok"] and query_result["result"]:
                 last_alias, last_date = query_result["result"]
@@ -1927,8 +2083,13 @@ def show_member_management_dialog(parent=None):
         log_file = write_swoc_member_list_log(members, changed=has_changes[0])
         _reveal_in_finder_and_refocus(log_file, dialog)
 
+        # Ensure the modal grab does not survive into the next SWOC dialogs.
+        current_grab = dialog.grab_current()
+        if current_grab is dialog:
+            dialog.grab_release()
+
         dialog.destroy()
-        run_swoc_schedule_generation(parent=None)
+        run_swoc_schedule_generation(parent=owner)
 
     
     # Create a frame with scrollbar
@@ -2358,15 +2519,39 @@ def show_member_management_dialog(parent=None):
 
 def main():
     root = tk.Tk()
-    root.title("Step 11: Publish Staff Schedule")
+    root.title("Telescope and Night Staff Schedule")
     root.geometry("640x320")
     root.resizable(False, False)
     startup_action = tk.StringVar(value="")
-    mode_var = tk.StringVar(value="excel")
+    mode_var = tk.StringVar(value="")
+    db_target_var = tk.StringVar(value="")
 
     tk.Label(
         root,
-        text="Night Staff Schedule — Choose workflow:",
+        text="Select Database Target:",
+        padx=16,
+        pady=2,
+        font=("Arial", 10, "bold"),
+    ).pack(anchor="w")
+
+    db_target_frame = tk.Frame(root, padx=24)
+    db_target_frame.pack(anchor="w", pady=(0, 6))
+    tk.Radiobutton(
+        db_target_frame,
+        text="Pre-Release (clone server)",
+        variable=db_target_var,
+        value="pre-release",
+    ).pack(anchor="w", pady=1)
+    tk.Radiobutton(
+        db_target_frame,
+        text="Release (production server)",
+        variable=db_target_var,
+        value="release",
+    ).pack(anchor="w", pady=1)
+
+    tk.Label(
+        root,
+        text="Select Workflow:",
         padx=16,
         pady=12,
         font=("Arial", 11, "bold"),
@@ -2374,16 +2559,44 @@ def main():
 
     radio_frame = tk.Frame(root, padx=24)
     radio_frame.pack(anchor="w", pady=4)
-    tk.Radiobutton(
-        radio_frame, text="SA / OA / NA — Import from Excel file", variable=mode_var, value="excel"
-    ).pack(anchor="w", pady=2)
-    tk.Radiobutton(
-        radio_frame, text="SWOC — Generate rotation schedule", variable=mode_var, value="swoc"
-    ).pack(anchor="w", pady=2)
+    excel_radio = tk.Radiobutton(
+        radio_frame,
+        text="Import from Excel (Schedule Type: Telescope or Night Staff SA / OA / NA)",
+        variable=mode_var,
+        value="excel",
+        state="disabled",
+    )
+    excel_radio.pack(anchor="w", pady=2)
+    swoc_radio = tk.Radiobutton(
+        radio_frame,
+        text="SWOC — Generate rotation schedule",
+        variable=mode_var,
+        value="swoc",
+        state="disabled",
+    )
+    swoc_radio.pack(anchor="w", pady=2)
+
+    workflow_radios = [excel_radio, swoc_radio]
+
+    def update_workflow_state(*_args):
+        has_target = db_target_var.get() in {"pre-release", "release"}
+        state = "normal" if has_target else "disabled"
+        for radio in workflow_radios:
+            radio.config(state=state)
+        if not has_target:
+            mode_var.set("")
+
+    db_target_var.trace_add("write", update_workflow_state)
+    update_workflow_state()
 
     tk.Label(
         root,
-        text="Both workflows generate SQL INSERT statements\nand update the Night Staff Schedule database.",
+        text=(
+            "After selecting database target, choose a workflow:\n"
+            "- Import from Excel (Telescope or SA/OA/NA)\n"
+            "- SWOC generation (defaults to next semester dates, editable)\n"
+            "Both workflows generate SQL INSERT statements and apply them to the selected database."
+        ),
         padx=16,
         pady=8,
         justify="left",
@@ -2391,7 +2604,26 @@ def main():
     ).pack(anchor="w")
 
     def select_mode():
-        startup_action.set(mode_var.get())
+        target = db_target_var.get()
+        if target not in {"pre-release", "release"}:
+            show_focused_info_dialog(
+                "Selection Required",
+                "Choose Database Target before selecting a workflow.",
+                parent=root,
+            )
+            return
+
+        chosen_mode = mode_var.get()
+        if chosen_mode not in {"excel", "swoc"}:
+            show_focused_info_dialog(
+                "Selection Required",
+                "Choose a workflow after selecting Database Target.",
+                parent=root,
+            )
+            return
+
+        _apply_active_db_target(target)
+        startup_action.set(chosen_mode)
 
     def cancel_startup():
         startup_action.set("cancel")
@@ -2416,8 +2648,7 @@ def main():
 
     # ── SWOC mode ──────────────────────────────────────────────────────────
     if chosen_mode == "swoc":
-        # Iconify instead of withdraw so the dialog has a live parent on macOS
-        root.iconify()
+        root.withdraw()
         show_member_management_dialog(parent=root)
         root.destroy()
         return
