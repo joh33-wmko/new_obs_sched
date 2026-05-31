@@ -46,9 +46,20 @@ def _normalize_semester_token(stem):
     return f"{year}{semester}"
 
 
-def _normalize_staff_type(stem):
-    match = re.search(r"(?<![A-Za-z0-9])(OA|NA|SA)(?![A-Za-z0-9])", stem, flags=re.IGNORECASE)
+def _normalize_sched_type(stem):
+    compact = re.sub(r"[^A-Za-z0-9]+", "", stem or "").lower()
+
+    match = re.search(
+        r"(?<![A-Za-z0-9])(TELESCOPE|OA|NA|SA|SWOC|EEOC)(?![A-Za-z0-9])",
+        stem,
+        flags=re.IGNORECASE,
+    )
     if not match:
+        telescope_match = re.search(r"keck[12]_\d{4}[ab](?:_[a-z0-9]+)*", stem or "", flags=re.IGNORECASE)
+        if not telescope_match:
+            telescope_match = re.search(r"keck[12]\d{4}[ab]", compact, flags=re.IGNORECASE)
+        if telescope_match:
+            return "TELESCOPE"
         return None
 
     return match.group(1).upper()
@@ -86,7 +97,7 @@ def _normalize_month_range(stem):
 def build_output_filename(file_path):
     stem = Path(file_path).stem
     semester = _normalize_semester_token(stem)
-    staff_type = _normalize_staff_type(stem)
+    staff_type = _normalize_sched_type(stem)
     month_range = _normalize_month_range(stem)
 
     if semester and staff_type:

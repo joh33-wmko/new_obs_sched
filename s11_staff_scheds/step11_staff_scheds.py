@@ -30,8 +30,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from common.obs_sem_utils import (
     _normalize_month_range,
+    _normalize_sched_type,
     _normalize_semester_token,
-    _normalize_staff_type,
     build_output_filename,
     ensure_data_dir,
     copy_source_to_data_dir,
@@ -418,29 +418,32 @@ def detect_processed_report_type(data_dir):
 
     filename = tracker_file.read_text(encoding="utf-8").strip()
     stem = Path(filename).stem
-    match = re.search(
-        r"(?<![A-Za-z0-9])(OA|NA|SA|SWOC|EEOC)(?![A-Za-z0-9])",
-        stem,
-        flags=re.IGNORECASE,
-    )
-    return match.group(1).upper() if match else "UNKNOWN"
+    sched_type = _normalize_sched_type(stem)
+    return sched_type if sched_type else "UNKNOWN"
 
 
 
 
 def infer_upload_type(xlsx_file_path=None, csv_file_path=None):
-    """Detect staff type from filename or return default."""
+    """Detect schedule type from filename or return default."""
     if xlsx_file_path:
-        xlsx_staff = _normalize_staff_type(Path(xlsx_file_path).stem)
-        if xlsx_staff:
-            return xlsx_staff.lower()
+        xlsx_sched = _normalize_sched_type(Path(xlsx_file_path).stem)
+        if xlsx_sched:
+            return xlsx_sched.lower()
 
     if csv_file_path:
-        csv_staff = _normalize_staff_type(Path(csv_file_path).stem)
-        if csv_staff:
-            return csv_staff.lower()
+        csv_sched = _normalize_sched_type(Path(csv_file_path).stem)
+        if csv_sched:
+            return csv_sched.lower()
 
     return get_config("NEW_OBS_SEM", "DEFAULT_UPLOAD_TYPE", "eeoc")
+
+
+def infer_telescope_number(source_file_path):
+    """Infer telescope number ('1' or '2') from a telescope filename."""
+    stem = Path(source_file_path).stem if source_file_path else ""
+    match = re.search(r"keck\s*([12])", stem, flags=re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 def _resolve_db_config(section_name):
@@ -475,11 +478,11 @@ def _apply_active_db_target(target_mode):
 
     mode = (target_mode or "pre-release").strip().lower()
     if mode == "release":
-        active_host = db_config.get("SSH_DB_PROD_HOST") or db_config.get("SSH_PROD_HOST")
-        active_hostname = db_config.get("SSH_DB_PROD_HOSTNAME") or db_config.get("SSH_PROD_HOSTNAME")
+        active_host = db_config.get("SSH_DB_PROD_HOST")
+        active_hostname = db_config.get("SSH_DB_PROD_HOSTNAME")
     else:
-        active_host = db_config.get("SSH_DB_CLONE_HOST") or db_config.get("SSH_CLONE_HOST")
-        active_hostname = db_config.get("SSH_DB_CLONE_HOSTNAME") or db_config.get("SSH_CLONE_HOSTNAME")
+        active_host = db_config.get("SSH_DB_CLONE_HOST")
+        active_hostname = db_config.get("SSH_DB_CLONE_HOSTNAME")
 
     if active_host:
         db_config["ACTIVE_DB_HOST"] = active_host
@@ -494,7 +497,7 @@ def _detect_active_db_target_mode():
         return "pre-release"
 
     active_host = db_config.get("ACTIVE_DB_HOST") or db_config.get("SSH_HOST")
-    prod_host = db_config.get("SSH_DB_PROD_HOST") or db_config.get("SSH_PROD_HOST")
+    prod_host = db_config.get("SSH_DB_PROD_HOST")
     if active_host and prod_host and str(active_host) == str(prod_host):
         return "release"
     return "pre-release"
@@ -622,6 +625,10 @@ def connect_to_remote_mysql_db():
     type_columns = get_config("DB_SERVER", "TYPE_COLUMNS", [])
     staff_types = get_config("DB_SERVER", "STAFF_TYPES", [])
     preferred_tables = get_config("DB_SERVER", "PREFERRED_TABLES", [])
+    data_dir = ensure_data_dir()
+    processed_type = detect_processed_report_type(data_dir)
+    if processed_type == "TELESCOPE":
+        preferred_tables = ["telSchedule", "nightStaff"]
 
     def _overview_operation(connection, settings):
         db_name = settings["database"]
@@ -793,16 +800,23 @@ def preflight_mysql_connection_check():
     return False
 
 
-def upload_csv_to_staff_site(csv_path, upload_type, verbose_enabled):
-    """Upload CSV file to staff schedule service."""
+def upload_csv_to_staff_site(csv_path, upload_type, verbose_enabled, telescope_number=None):
+    """Upload CSV file to the appropriate schedule upload service."""
     session = requests.Session()
     session.mount("https://", LegacyTLSAdapter())
 
-    form_data = {"type": upload_type, "submit": "Submit"}
+    if str(upload_type).strip().lower() == "telescope":
+        form_data = {"submit": "Submit"}
+        if telescope_number:
+            form_data["telnr"] = str(telescope_number)
+    else:
+        form_data = {"type": upload_type, "submit": "Submit"}
+
     if verbose_enabled:
         form_data["verbose"] = "on"
 
-    upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
+    upload_key = "TELESCOPE_UPLOAD_URL" if str(upload_type).strip().lower() == "telescope" else "STAFF_UPLOAD_URL"
+    upload_url = get_config("NEW_OBS_SEM", upload_key)
     with open(csv_path, "rb") as file_handle:
         response = session.post(
             str(upload_url),
@@ -919,13 +933,20 @@ def confirm_staff_type_dialog(staff_type, file_path, parent=None):
     dialog.resizable(True, True)
 
     staff_type_display = staff_type.upper() if staff_type else "UNKNOWN"
+    if staff_type == "TELESCOPE":
+        label_text = "Detected Schedule Type"
+        staff_type_display = "Telescope"
+    elif staff_type in {"OA", "NA", "SA"}:
+        label_text = "Detected Staff Schedule Type"
+    else:
+        label_text = "Detected Schedule Type"
     cancelled = [False]
 
     tk.Label(
         dialog,
         text=(
             f"File: {Path(file_path).name}\n\n"
-            f"Detected staff type: {staff_type_display}\n\n"
+            f"{label_text}: {staff_type_display}\n\n"
             "Is this correct?"
         ),
         padx=16,
@@ -1118,32 +1139,55 @@ def export_sheet(file_path, sheet_name, data_dir, upload_enabled, staff_type=Non
     sql_file = None
 
     if upload_enabled:
-        upload_url = get_config("NEW_OBS_SEM", "STAFF_UPLOAD_URL")
+        upload_type = infer_upload_type(xlsx_file_path=file_path, csv_file_path=output)
+        upload_key = "TELESCOPE_UPLOAD_URL" if upload_type == "telescope" else "STAFF_UPLOAD_URL"
+        upload_url = get_config("NEW_OBS_SEM", upload_key)
+        telescope_number = infer_telescope_number(file_path) if upload_type == "telescope" else None
         _debug_log(
             "Upload URL check: "
             f"value={repr(upload_url)}, "
+            f"upload_key={upload_key!r}, "
+            f"telescope_number={telescope_number!r}, "
             f"new_obs_sem_type={type(LIVE_CONFIG.get('NEW_OBS_SEM')).__name__}, "
             f"config_sections={list(LIVE_CONFIG.keys())}"
         )
         if not upload_url:
+            missing_key = upload_key
             show_focused_info_dialog(
                 "Invalid upload URL",
-                "STAFF_UPLOAD_URL is missing in common/config.live.ini"
+                f"{missing_key} is missing in common/config.live.ini"
+            )
+            return False
+        if upload_type == "telescope" and not telescope_number:
+            show_focused_info_dialog(
+                "Invalid telescope file",
+                "Could not infer telescope number (1 or 2) from the filename.\n"
+                "Use a filename containing Keck1 or Keck2."
             )
             return False
 
-        upload_type = infer_upload_type(xlsx_file_path=file_path, csv_file_path=output)
         try:
-            verbose_response = upload_csv_to_staff_site(output, upload_type, verbose_enabled=True)
+            verbose_response = upload_csv_to_staff_site(
+                output,
+                upload_type,
+                verbose_enabled=True,
+                telescope_number=telescope_number,
+            )
             verbose_file = data_dir / "last_upload_verbose.html"
             open_response_in_integrated_browser(verbose_response.text, verbose_file)
 
-            final_response = upload_csv_to_staff_site(output, upload_type, verbose_enabled=False)
+            final_response = upload_csv_to_staff_site(
+                output,
+                upload_type,
+                verbose_enabled=False,
+                telescope_number=telescope_number,
+            )
             final_results_file = data_dir / "last_upload_sql_results.html"
             open_response_in_integrated_browser(final_response.text, final_results_file)
             sql_file = save_insert_statements(final_response.text, output, data_dir)
+            upload_label = "Schedule type" if upload_type == "telescope" else "Staff schedule type"
             upload_message = (
-                f"===== Processing staff type: {upload_type.upper()} =====\n"
+                f"===== Processing {upload_label}: {upload_type.upper()} =====\n"
                 #f"Verbose HTTP {verbose_response.status_code}\nFinal HTTP {final_response.status_code}\n\n"
             )
         except Exception as error:
@@ -2662,7 +2706,7 @@ def main():
         return
 
     # Detect and confirm staff type
-    detected_staff_type = _normalize_staff_type(Path(file_path).stem)
+    detected_staff_type = _normalize_sched_type(Path(file_path).stem)
     if not confirm_staff_type_dialog(detected_staff_type or "unknown", file_path, parent=root):
         root.destroy()
         return
